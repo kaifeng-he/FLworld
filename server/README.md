@@ -56,4 +56,4 @@ LLM_MODEL = "deepseek-v4-flash"
 npm run deploy
 ```
 
-部署后，把 Android App 设置页里的后端地址改成 Cloudflare 给出的 Worker URL。
+Android App 里已经固定线上 Worker 地址，不需要在 App 内填写后端地址。

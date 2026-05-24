@@ -4,7 +4,9 @@
 
     <application
         android:allowBackup="true"
-        android:label="hkf 和 cl 的小世界"
+        android:icon="@drawable/app_icon"
+        android:roundIcon="@drawable/app_icon"
+        android:label="@string/app_name"
         android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
         <activity

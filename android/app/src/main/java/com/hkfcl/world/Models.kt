@@ -13,7 +13,8 @@ data class ChatSession(
     val id: String,
     val title: String,
     val personaId: String,
-    val createdBy: String
+    val createdBy: String,
+    val updatedAt: String = ""
 )
 
 data class ChatMessage(
@@ -21,7 +22,8 @@ data class ChatMessage(
     val sessionId: String,
     val role: String,
     val senderId: String,
-    val text: String
+    val text: String,
+    val createdAt: String = ""
 )
 
 data class Feature(
@@ -35,9 +37,40 @@ data class DistanceState(
     val kilometers: Double?
 )
 
+data class Note(
+    val id: String,
+    val authorId: String,
+    val text: String,
+    val createdAt: String,
+    val readAt: String?
+)
+
+data class CalendarEvent(
+    val id: String,
+    val date: String,
+    val title: String,
+    val note: String,
+    val createdBy: String
+)
+
+data class AlbumItem(
+    val id: String,
+    val uploaderId: String,
+    val mediaType: String,
+    val mimeType: String,
+    val fileName: String,
+    val byteSize: Long,
+    val createdAt: String,
+    val dataBase64: String? = null
+)
+
+data class AlbumQuotaState(
+    val usedBytes: Long,
+    val limitBytes: Long
+)
+
 enum class Tab(val label: String) {
     Chat("聊天"),
-    Distance("距离"),
     World("小世界"),
-    Settings("设置")
+    Mine("我的")
 }
