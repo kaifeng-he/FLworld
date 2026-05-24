@@ -1,11 +1,14 @@
 package com.hkfcl.world
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.provider.MediaStore
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -376,11 +379,28 @@ fun WorldApp() {
                                     .onFailure { status = it.message ?: "删除失败" }
                             }
                         },
+                        onRename = { item, name ->
+                            scope.launch {
+                                runCatching { api.renameAlbumItem(item.id, name) }
+                                    .onSuccess { renamed ->
+                                        albumItems = albumItems.map { if (it.id == renamed.id) renamed else it }
+                                        status = ""
+                                    }
+                                    .onFailure { status = it.message ?: "改名失败" }
+                            }
+                        },
                         onLoadItem = { id, onLoaded ->
                             scope.launch {
                                 runCatching { api.albumItem(id) }
                                     .onSuccess { onLoaded(it) }
                                     .onFailure { status = it.message ?: "加载失败" }
+                            }
+                        },
+                        onSaveImage = { item ->
+                            scope.launch {
+                                runCatching { saveImageToGallery(context, item) }
+                                    .onSuccess { status = "已保存到手机相册" }
+                                    .onFailure { status = it.message ?: "保存失败" }
                             }
                         }
                     )
@@ -722,7 +742,9 @@ private fun AlbumScreen(
     onBack: () -> Unit,
     onUpload: (String, String, ByteArray, String) -> Unit,
     onDelete: (AlbumItem) -> Unit,
-    onLoadItem: (String, (AlbumItem) -> Unit) -> Unit
+    onRename: (AlbumItem, String) -> Unit,
+    onLoadItem: (String, (AlbumItem) -> Unit) -> Unit,
+    onSaveImage: (AlbumItem) -> Unit
 ) {
     val context = LocalContext.current
     var preview by remember { mutableStateOf<AlbumItem?>(null) }
@@ -751,25 +773,18 @@ private fun AlbumScreen(
         Spacer(Modifier.height(10.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(items) { item ->
-                SectionCard(Modifier.clickable { onLoadItem(item.id) { preview = it } }) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            Modifier
-                                .size(46.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(Color(0xFFFFE8EE)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(if (item.mediaType == "video") "视频" else "照片")
+                AlbumRow(
+                    item = item,
+                    onPreview = { onLoadItem(item.id) { preview = it } },
+                    onRename = onRename,
+                    onDownload = {
+                        onLoadItem(item.id) { fullItem ->
+                            preview = fullItem
+                            onSaveImage(fullItem)
                         }
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(item.fileName, fontWeight = FontWeight.SemiBold)
-                            Text("${displayName(item.uploaderId)} · ${sizeText(item.byteSize)}", color = Color(0xFF6F5F66))
-                        }
-                        TextButton(onClick = { onDelete(item) }) { Text("删除") }
-                    }
-                }
+                    },
+                    onDelete = onDelete
+                )
             }
         }
     }
@@ -793,8 +808,69 @@ private fun AlbumPreview(item: AlbumItem) {
                     contentScale = ContentScale.Crop
                 )
             }
+            Spacer(Modifier.height(8.dp))
+            Text("轻点列表中的照片可以在这里预览。", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
         } else {
             Text("这是一段视频，已经保存在相册里。", color = Color(0xFF6F5F66))
+        }
+    }
+}
+
+@Composable
+private fun AlbumRow(
+    item: AlbumItem,
+    onPreview: () -> Unit,
+    onRename: (AlbumItem, String) -> Unit,
+    onDownload: () -> Unit,
+    onDelete: (AlbumItem) -> Unit
+) {
+    var editing by remember(item.id) { mutableStateOf(false) }
+    var name by remember(item.fileName) { mutableStateOf(fileBaseName(item.fileName)) }
+    SectionCard(Modifier.clickable { onPreview() }) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(46.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFFFFE8EE)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(if (item.mediaType == "video") "视频" else "照片")
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                if (editing) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("名字") },
+                        suffix = { Text(fileExtension(item.fileName)) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Text(item.fileName, fontWeight = FontWeight.SemiBold)
+                    Text("${displayName(item.uploaderId)} · ${sizeText(item.byteSize)}", color = Color(0xFF6F5F66))
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+            if (editing) {
+                TextButton(onClick = {
+                    val value = name.trim()
+                    if (value.isNotEmpty()) {
+                        onRename(item, value)
+                        editing = false
+                    }
+                }) { Text("保存") }
+                TextButton(onClick = {
+                    name = fileBaseName(item.fileName)
+                    editing = false
+                }) { Text("取消") }
+            } else {
+                TextButton(onClick = { editing = true }) { Text("改名") }
+                if (item.mediaType == "image") TextButton(onClick = onDownload) { Text("下载") }
+                TextButton(onClick = { onDelete(item) }) { Text("删除") }
+            }
         }
     }
 }
@@ -972,4 +1048,34 @@ private fun Context.displayName(uri: Uri): String {
         if (index >= 0 && cursor.moveToFirst()) return cursor.getString(index)
     }
     return "珍贵回忆"
+}
+
+private fun fileBaseName(fileName: String): String =
+    fileName.substringBeforeLast('.', fileName)
+
+private fun fileExtension(fileName: String): String {
+    val index = fileName.lastIndexOf('.')
+    return if (index > 0 && index < fileName.lastIndex) fileName.substring(index) else ""
+}
+
+private fun saveImageToGallery(context: Context, item: AlbumItem) {
+    if (item.mediaType != "image") error("只能下载图片")
+    val data = item.dataBase64 ?: error("图片还没有加载完成")
+    val bytes = Base64.decode(data, Base64.DEFAULT)
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, item.fileName)
+        put(MediaStore.Images.Media.MIME_TYPE, item.mimeType)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FL小世界")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+    }
+    val resolver = context.contentResolver
+    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("无法创建图片")
+    resolver.openOutputStream(uri)?.use { output -> output.write(bytes) } ?: error("无法写入图片")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        values.clear()
+        values.put(MediaStore.Images.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    }
 }

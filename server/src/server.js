@@ -336,6 +336,18 @@ async function route(request, env) {
     return json({ ok: true });
   }
 
+  const albumRenameMatch = pathName.match(/^album\/([^/]+)\/name$/);
+  if (albumRenameMatch && request.method === "PUT") {
+    const item = await env.DB.prepare(
+      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items WHERE id = ?"
+    ).bind(albumRenameMatch[1]).first();
+    if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
+    const body = await readJson(request);
+    const nextName = albumNameWithOriginalExtension(requiredString(body.name, "名字"), item.fileName);
+    await env.DB.prepare("UPDATE album_items SET file_name = ? WHERE id = ?").bind(nextName, item.id).run();
+    return json({ item: { ...item, fileName: nextName } });
+  }
+
   if (request.method === "POST" && pathName === "location/update") {
     const body = await readJson(request);
     const latitude = Number(body.latitude);
@@ -668,6 +680,21 @@ function cleanTitle(text) {
     .replace(/[《》"'“”]/g, "")
     .trim()
     .slice(0, 18);
+}
+
+function albumNameWithOriginalExtension(name, originalFileName) {
+  const cleanName = name
+    .replace(/[\\/:*?"<>|]/g, "")
+    .trim()
+    .slice(0, 80);
+  const originalExtension = fileExtension(originalFileName);
+  const base = cleanName.replace(/\.[^.]+$/, "") || "珍贵回忆";
+  return `${base}${originalExtension}`;
+}
+
+function fileExtension(fileName) {
+  const match = String(fileName || "").match(/(\.[A-Za-z0-9]{1,12})$/);
+  return match ? match[1] : "";
 }
 
 function nextMonth(month) {

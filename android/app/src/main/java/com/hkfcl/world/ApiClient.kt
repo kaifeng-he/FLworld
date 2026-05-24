@@ -5,6 +5,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -101,15 +102,23 @@ class ApiClient(
             val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
             error(JSONObject(errorText.ifBlank { "{}" }).optString("message", "发送失败"))
         }
-        connection.inputStream.bufferedReader().use { reader ->
-            readEventStream(reader) { event, data ->
-                when (event) {
-                    "user" -> onUserMessage(data.getJSONObject("message").toChatMessage())
-                    "chunk" -> onChunk(data.optString("text"))
-                    "done" -> onDone(data.getJSONObject("message").toChatMessage(), data.optString("title").ifBlank { null })
-                    "error" -> error(data.optString("message", "回复生成失败"))
+        var completed = false
+        try {
+            connection.inputStream.bufferedReader().use { reader ->
+                readEventStream(reader) { event, data ->
+                    when (event) {
+                        "user" -> onUserMessage(data.getJSONObject("message").toChatMessage())
+                        "chunk" -> onChunk(data.optString("text"))
+                        "done" -> {
+                            completed = true
+                            onDone(data.getJSONObject("message").toChatMessage(), data.optString("title").ifBlank { null })
+                        }
+                        "error" -> error(data.optString("message", "回复生成失败"))
+                    }
                 }
             }
+        } catch (error: IOException) {
+            if (!completed || error.message?.contains("unexpected end of stream", ignoreCase = true) != true) throw error
         }
     }
 
@@ -179,6 +188,11 @@ class ApiClient(
 
     suspend fun albumItem(id: String): AlbumItem {
         val item = request("GET", "/album/$id").getJSONObject("item")
+        return item.toAlbumItem()
+    }
+
+    suspend fun renameAlbumItem(id: String, name: String): AlbumItem {
+        val item = request("PUT", "/album/$id/name", JSONObject().put("name", name)).getJSONObject("item")
         return item.toAlbumItem()
     }
 
