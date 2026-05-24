@@ -191,7 +191,7 @@ class ApiClient(
         )
     }
 
-    suspend fun uploadAlbumItem(fileName: String, mimeType: String, bytes: ByteArray, dataBase64: String): AlbumItem {
+    suspend fun uploadAlbumItem(fileName: String, mimeType: String, bytes: ByteArray, dataBase64: String, previewBase64: String?): AlbumItem {
         val item = request(
             "POST",
             "/album",
@@ -200,6 +200,7 @@ class ApiClient(
                 .put("mimeType", mimeType)
                 .put("byteSize", bytes.size)
                 .put("dataBase64", dataBase64)
+                .put("previewBase64", previewBase64.orEmpty())
         ).getJSONObject("item")
         return item.toAlbumItem()
     }
@@ -322,6 +323,7 @@ private fun JSONObject.toAlbumItem(): AlbumItem =
         fileName = getString("fileName"),
         byteSize = getLong("byteSize"),
         createdAt = getString("createdAt"),
+        previewBase64 = optNullableString("previewBase64"),
         dataBase64 = optNullableString("dataBase64")
     )
 

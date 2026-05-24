@@ -3,6 +3,7 @@ package com.hkfcl.world
 import android.Manifest
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
@@ -62,16 +63,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -220,7 +225,7 @@ fun WorldApp() {
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = Color.White) {
+            NavigationBar(containerColor = Color.White.copy(alpha = 0.92f)) {
                 Tab.entries.forEach { item ->
                     NavigationBarItem(
                         selected = tab == item,
@@ -235,15 +240,15 @@ fun WorldApp() {
             }
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-                .padding(padding)
-                .padding(16.dp)
-        ) {
-            when (tab) {
-                Tab.Chat -> ChatScreen(
+        AppBackground {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(16.dp)
+            ) {
+                when (tab) {
+                    Tab.Chat -> ChatScreen(
                     currentUserId = userId,
                     personas = personas,
                     sessions = sessions,
@@ -290,7 +295,7 @@ fun WorldApp() {
                     },
                     onCreateSession = { personaId ->
                         scope.launch {
-                            runCatching { api.createSession("新的聊天", personaId) }
+                            runCatching { api.createSession("新的聊天", personaId.ifBlank { DEFAULT_PERSONA_ID }) }
                                 .onSuccess {
                                     selectedSession = it
                                     sessions = listOf(it) + sessions
@@ -344,13 +349,14 @@ fun WorldApp() {
                     }
                 )
 
-                Tab.World -> when (activeWorldPage) {
+                    Tab.World -> when (activeWorldPage) {
                     null -> WorldHomeScreen(
                         distance = distance,
                         notes = notes,
                         calendarEvents = calendarEvents,
                         albumQuota = albumQuota,
                         onOpen = { activeWorldPage = it },
+                        onOpenCalendar = { activeWorldPage = WorldPage.Calendar },
                         onRefreshDistance = {
                             if (locationHelper.hasPermission()) syncLocation() else locationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
                         }
@@ -363,7 +369,7 @@ fun WorldApp() {
                             scope.launch {
                                 runCatching { api.createNote(text) }
                                     .onSuccess {
-                                        notes = listOf(it) + notes
+                            notes = (notes + it).sortedBy { item -> item.createdAt }
                                     }
                                     .onFailure { report(it.message ?: "留言失败") }
                             }
@@ -409,9 +415,9 @@ fun WorldApp() {
                         items = albumItems,
                         quota = albumQuota,
                         onBack = { activeWorldPage = null },
-                        onUpload = { name, mimeType, bytes, base64 ->
+                        onUpload = { name, mimeType, bytes, base64, previewBase64 ->
                             scope.launch {
-                                runCatching { api.uploadAlbumItem(name, mimeType, bytes, base64) }
+                                runCatching { api.uploadAlbumItem(name, mimeType, bytes, base64, previewBase64) }
                                     .onSuccess { refreshAlbum() }
                                     .onFailure { report(it.message ?: "上传失败") }
                             }
@@ -449,7 +455,7 @@ fun WorldApp() {
                     )
                 }
 
-                Tab.Mine -> MineScreen(
+                    Tab.Mine -> MineScreen(
                     userName = userName,
                     errorLogs = errorLogs,
                     onLogout = {
@@ -458,7 +464,8 @@ fun WorldApp() {
                         selectedSession = null
                         messages = emptyList()
                     }
-                )
+                    )
+                }
             }
         }
     }
@@ -473,31 +480,32 @@ private fun LoginScreen(
     onCode: (String) -> Unit,
     onLogin: () -> Unit
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(softBrush())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text("FL小世界", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
-        Text("只属于两个人的陪伴、记录和日常。", color = Color(0xFF7B626A), modifier = Modifier.padding(top = 6.dp))
-        Spacer(Modifier.height(28.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            IdentityButton("锋宝", selectedUserId == "hkf", Modifier.weight(1f)) { onUserId("hkf") }
-            IdentityButton("璐宝", selectedUserId == "cl", Modifier.weight(1f)) { onUserId("cl") }
+    AppBackground {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text("FL小世界", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
+            Text("只属于两个人的陪伴、记录和日常。", color = Color(0xFF7B626A), modifier = Modifier.padding(top = 6.dp))
+            Spacer(Modifier.height(28.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                IdentityButton("锋宝", selectedUserId == "hkf", Modifier.weight(1f)) { onUserId("hkf") }
+                IdentityButton("璐宝", selectedUserId == "cl", Modifier.weight(1f)) { onUserId("cl") }
+            }
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = code,
+                onValueChange = onCode,
+                label = { Text("进入口令") },
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onLogin, modifier = Modifier.fillMaxWidth()) { Text("进入小世界") }
+            if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp))
         }
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = code,
-            onValueChange = onCode,
-            label = { Text("进入口令") },
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(18.dp))
-        Button(onClick = onLogin, modifier = Modifier.fillMaxWidth()) { Text("进入小世界") }
-        if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp))
     }
 }
 
@@ -527,8 +535,7 @@ private fun ChatScreen(
     onSend: (String) -> Unit
 ) {
     var draft by remember { mutableStateOf("") }
-    var selectedPersona by remember(personas) { mutableStateOf(personas.firstOrNull()?.id.orEmpty()) }
-    var showPersonaForm by remember { mutableStateOf(false) }
+    var showPersonaManager by remember { mutableStateOf(false) }
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
     var deletingPersona by remember { mutableStateOf<Persona?>(null) }
     var deletingSession by remember { mutableStateOf<ChatSession?>(null) }
@@ -537,69 +544,32 @@ private fun ChatScreen(
     if (selectedSession == null) {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
-                SectionCard {
-                    Text("今天想聊点什么？", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text("可以换一种聊天风格，再开始新的对话。", color = Color(0xFF7B626A))
-                    Spacer(Modifier.height(10.dp))
-                    PersonaPicker(personas, selectedPersona, onChange = { selectedPersona = it })
-                    Spacer(Modifier.height(8.dp))
+                SectionCard(containerColor = Color.White.copy(alpha = 0.88f)) {
+                    Text("聊天", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF6B2944))
+                    Text("默认使用温柔情感陪伴。", color = Color(0xFF7B626A))
+                    Spacer(Modifier.height(14.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
-                            onClick = { onCreateSession(selectedPersona.ifBlank { personas.firstOrNull()?.id.orEmpty() }) },
+                            onClick = { onCreateSession(DEFAULT_PERSONA_ID) },
                             enabled = personas.isNotEmpty(),
                             modifier = Modifier.weight(1f)
-                        ) { Text("开始聊天") }
-                        OutlinedButton(onClick = { showPersonaForm = !showPersonaForm }) { Text("聊天风格") }
-                    }
-                    if (showPersonaForm) {
-                        PersonaForm(
-                            persona = editingPersona,
-                            onSave = { persona, name, desc, memory, color ->
-                                if (persona == null) onCreatePersona(name, desc, memory, color)
-                                else onUpdatePersona(persona, name, desc, memory, color)
-                                editingPersona = null
-                                showPersonaForm = false
-                            },
-                            onCancel = {
-                                editingPersona = null
-                                showPersonaForm = false
-                            }
-                        )
-                    }
-                }
-            }
-            items(personas) { persona ->
-                SectionCard {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                        Box(
-                            Modifier
-                                .size(24.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(parseColor(persona.bubbleColor))
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(persona.name, fontWeight = FontWeight.SemiBold)
-                            Text(persona.description, color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                        TextButton(onClick = {
-                            editingPersona = persona
-                            showPersonaForm = true
-                        }) { Text("编辑") }
-                        TextButton(
-                            onClick = { deletingPersona = persona },
-                            enabled = persona.id != "emotional-support"
-                        ) { Text("删除") }
+                        ) { Text("新建对话") }
+                        OutlinedButton(onClick = { showPersonaManager = true }) { Text("聊天风格") }
                     }
                 }
             }
             item {
-                OutlinedButton(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("同步聊天") }
+                Text("历史对话", fontWeight = FontWeight.SemiBold, color = Color(0xFF6B2944), modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+            }
+            if (sessions.isEmpty()) {
+                item {
+                    SectionCard(containerColor = Color.White.copy(alpha = 0.82f)) {
+                        Text("还没有历史对话。", color = Color(0xFF6F5F66))
+                    }
+                }
             }
             items(sessions) { session ->
-                SectionCard(Modifier.clickable { onSelectSession(session) }) {
+                SectionCard(Modifier.clickable { onSelectSession(session) }, containerColor = Color.White.copy(alpha = 0.9f)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Text(session.title, fontWeight = FontWeight.SemiBold)
@@ -609,6 +579,28 @@ private fun ChatScreen(
                     }
                 }
             }
+            item {
+                OutlinedButton(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("同步聊天") }
+            }
+        }
+        if (showPersonaManager) {
+            PersonaManagerDialog(
+                personas = personas,
+                editingPersona = editingPersona,
+                onEdit = { persona -> editingPersona = persona },
+                onDelete = { persona -> deletingPersona = persona },
+                onSave = { persona, name, desc, memory, color ->
+                    if (persona == null) onCreatePersona(name, desc, memory, color)
+                    else onUpdatePersona(persona, name, desc, memory, color)
+                    editingPersona = null
+                    showPersonaManager = false
+                },
+                onCancelEdit = { editingPersona = null },
+                onDismiss = {
+                    editingPersona = null
+                    showPersonaManager = false
+                }
+            )
         }
         deletingPersona?.let { persona ->
             ConfirmDialog(
@@ -636,17 +628,22 @@ private fun ChatScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            TextButton(onClick = onBackToSessions) { Text("返回") }
-            Text(
-                selectedSession.title,
-                modifier = Modifier.weight(1f),
-                textAlign = TextAlign.Center,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.titleMedium
-            )
-            TextButton(onClick = { onSelectSession(selectedSession) }) { Text("刷新") }
+        SectionCard(containerColor = Color.White.copy(alpha = 0.88f)) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                TextButton(onClick = onBackToSessions) { Text("返回") }
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        selectedSession.title,
+                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(activePersona?.name ?: "默认聊天风格", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
+                }
+                TextButton(onClick = { onSelectSession(selectedSession) }) { Text("刷新") }
+            }
         }
+        Spacer(Modifier.height(10.dp))
         LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(messages) { message ->
                 val mine = message.senderId == currentUserId
@@ -704,6 +701,7 @@ private fun WorldHomeScreen(
     calendarEvents: List<CalendarEvent>,
     albumQuota: AlbumQuotaState?,
     onOpen: (WorldPage) -> Unit,
+    onOpenCalendar: () -> Unit,
     onRefreshDistance: () -> Unit
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -733,9 +731,11 @@ private fun WorldHomeScreen(
             }
         }
         item {
-            SectionCard {
+            SectionCard(Modifier.clickable { onOpenCalendar() }) {
                 Text("近期日子", fontWeight = FontWeight.SemiBold)
-                Text(calendarEvents.firstOrNull()?.let { "${it.date} · ${it.title}" } ?: "还没有记录重要日子。", color = Color(0xFF6F5F66))
+                val preview = calendarEvents.take(3).joinToString("\n") { "${it.date} · ${it.title}" }
+                Text(preview.ifBlank { "还没有记录重要日子。" }, color = Color(0xFF6F5F66))
+                Text("点击查看所有日子", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
             }
         }
     }
@@ -768,7 +768,7 @@ private fun NotesScreen(
         }
         Spacer(Modifier.height(10.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(notes) { note ->
+            items(notes.sortedBy { it.createdAt }) { note ->
                 LaunchedEffect(note.id) { onMarkRead(note) }
                 val mine = note.authorId == currentUserId
                 MessageBubble(
@@ -855,7 +855,7 @@ private fun AlbumScreen(
     items: List<AlbumItem>,
     quota: AlbumQuotaState?,
     onBack: () -> Unit,
-    onUpload: (String, String, ByteArray, String) -> Unit,
+    onUpload: (String, String, ByteArray, String, String?) -> Unit,
     onDelete: (AlbumItem) -> Unit,
     onRename: (AlbumItem, String) -> Unit,
     onLoadItem: (String, (AlbumItem) -> Unit) -> Unit,
@@ -869,7 +869,8 @@ private fun AlbumScreen(
             val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
             val name = context.displayName(uri)
             val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-            onUpload(name, mimeType, bytes, base64)
+            val previewBase64 = if (mimeType.startsWith("image/")) imagePreviewBase64(bytes) else null
+            onUpload(name, mimeType, bytes, base64, previewBase64)
         }
     }
 
@@ -890,7 +891,13 @@ private fun AlbumScreen(
             items(items) { item ->
                 AlbumRow(
                     item = item,
-                    onPreview = { onLoadItem(item.id) { preview = it } },
+                    onPreview = {
+                        if (item.previewBase64?.isNotBlank() == true) {
+                            preview = item
+                        } else {
+                            onLoadItem(item.id) { preview = it }
+                        }
+                    },
                     onRename = onRename,
                     onDownload = {
                         onLoadItem(item.id) { fullItem ->
@@ -909,9 +916,10 @@ private fun AlbumScreen(
 private fun AlbumPreview(item: AlbumItem) {
     SectionCard {
         Text(item.fileName, fontWeight = FontWeight.SemiBold)
-        val bytes = item.dataBase64?.let { Base64.decode(it, Base64.DEFAULT) }
+        val imageData = item.previewBase64?.takeIf { it.isNotBlank() } ?: item.dataBase64
+        val bytes = imageData?.let { Base64.decode(it, Base64.DEFAULT) }
         if (item.mediaType == "image" && bytes != null) {
-            val bitmap = remember(item.id) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+            val bitmap = remember(item.id, imageData) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
             bitmap?.let {
                 Image(
                     bitmap = it.asImageBitmap(),
@@ -924,7 +932,7 @@ private fun AlbumPreview(item: AlbumItem) {
                 )
             }
             Spacer(Modifier.height(8.dp))
-            Text("轻点列表中的照片可以在这里预览。", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+            Text("这里显示快速预览，下载时会保存原图。", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
         } else {
             Text("这是一段视频，已经保存在相册里。", color = Color(0xFF6F5F66))
         }
@@ -1024,6 +1032,56 @@ private fun MineScreen(
 }
 
 @Composable
+private fun PersonaManagerDialog(
+    personas: List<Persona>,
+    editingPersona: Persona?,
+    onEdit: (Persona) -> Unit,
+    onDelete: (Persona) -> Unit,
+    onSave: (Persona?, String, String, String, String) -> Unit,
+    onCancelEdit: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("聊天风格") },
+        text = {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                item {
+                    PersonaForm(
+                        persona = editingPersona,
+                        onSave = onSave,
+                        onCancel = onCancelEdit
+                    )
+                }
+                items(personas) { persona ->
+                    val isDefault = persona.id == DEFAULT_PERSONA_ID
+                    SectionCard(containerColor = Color(0xFFFFFBFD)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Box(
+                                Modifier
+                                    .size(24.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(parseColor(persona.bubbleColor))
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(if (isDefault) "${persona.name} · 默认" else persona.name, fontWeight = FontWeight.SemiBold)
+                                Text(persona.description, color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                            TextButton(onClick = { onEdit(persona) }, enabled = !isDefault) { Text("编辑") }
+                            TextButton(onClick = { onDelete(persona) }, enabled = !isDefault) { Text("删除") }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } }
+    )
+}
+
+@Composable
 private fun PersonaForm(
     persona: Persona?,
     onSave: (Persona?, String, String, String, String) -> Unit,
@@ -1100,9 +1158,9 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
         modifier = modifier
             .height(118.dp)
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.9f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
             Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
@@ -1115,14 +1173,47 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
 }
 
 @Composable
-private fun SectionCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+private fun SectionCard(
+    modifier: Modifier = Modifier,
+    containerColor: Color = Color.White.copy(alpha = 0.9f),
+    content: @Composable ColumnScope.() -> Unit
+) {
     Card(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = containerColor),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(Modifier.padding(14.dp), content = content)
+    }
+}
+
+@Composable
+private fun AppBackground(content: @Composable () -> Unit) {
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        Image(
+            painter = painterResource(id = R.drawable.app_icon),
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxSize()
+                .blur(28.dp)
+                .alpha(0.18f),
+            contentScale = ContentScale.Crop
+        )
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            Color(0xFFFFF7FA).copy(alpha = 0.88f),
+                            Color(0xFFFFFBF7).copy(alpha = 0.9f),
+                            Color(0xFFF2F7FF).copy(alpha = 0.88f)
+                        )
+                    )
+                )
+        )
+        content()
     }
 }
 
@@ -1156,6 +1247,8 @@ private enum class WorldPage {
     Calendar,
     Album
 }
+
+private const val DEFAULT_PERSONA_ID = "emotional-support"
 
 private fun tabIcon(tab: Tab): String = when (tab) {
     Tab.Chat -> "聊"
@@ -1250,6 +1343,27 @@ private fun fileBaseName(fileName: String): String =
 private fun fileExtension(fileName: String): String {
     val index = fileName.lastIndexOf('.')
     return if (index > 0 && index < fileName.lastIndex) fileName.substring(index) else ""
+}
+
+private fun imagePreviewBase64(bytes: ByteArray): String? {
+    val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+    val maxSide = maxOf(source.width, source.height).coerceAtLeast(1)
+    val scale = 360f / maxSide
+    val preview = if (scale < 1f) {
+        Bitmap.createScaledBitmap(
+            source,
+            (source.width * scale).toInt().coerceAtLeast(1),
+            (source.height * scale).toInt().coerceAtLeast(1),
+            true
+        )
+    } else {
+        source
+    }
+    val output = ByteArrayOutputStream()
+    preview.compress(Bitmap.CompressFormat.JPEG, 45, output)
+    if (preview !== source) preview.recycle()
+    source.recycle()
+    return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
 }
 
 private fun saveImageToGallery(context: Context, item: AlbumItem) {

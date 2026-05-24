@@ -83,6 +83,9 @@ async function route(request, env) {
 
   const personaMatch = pathName.match(/^bot\/personas\/([^/]+)$/);
   if (request.method === "PUT" && personaMatch) {
+    if (personaMatch[1] === DEFAULT_PERSONA_ID) {
+      return json({ error: "default_persona", message: "默认聊天风格不能编辑" }, 400);
+    }
     const body = await readJson(request);
     const persona = {
       id: personaMatch[1],
@@ -250,7 +253,7 @@ async function route(request, env) {
     const base = "SELECT id, date, title, note, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM calendar_events";
     const statement = month
       ? env.DB.prepare(`${base} WHERE date >= ? AND date < ? ORDER BY date ASC, created_at ASC`).bind(`${month}-01`, nextMonth(month))
-      : env.DB.prepare(`${base} ORDER BY date ASC, created_at ASC LIMIT 120`);
+      : env.DB.prepare(`${base} ORDER BY date ASC, created_at ASC`);
     const { results } = await statement.all();
     return json({ events: results });
   }
@@ -299,8 +302,11 @@ async function route(request, env) {
   }
 
   if (request.method === "GET" && pathName === "album") {
+    const hasPreview = await albumItemsHasPreviewData(env.DB);
     const { results } = await env.DB.prepare(
-      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
+      hasPreview
+        ? "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, preview_base64 AS previewBase64, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
+        : "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
     ).all();
     const usedBytes = await albumUsedBytes(env.DB);
     return json({ items: results, quota: { usedBytes, limitBytes: ALBUM_QUOTA_BYTES } });
@@ -317,6 +323,7 @@ async function route(request, env) {
     }
     const mimeType = String(body.mimeType || "application/octet-stream").slice(0, 120);
     const mediaType = mimeType.startsWith("video/") ? "video" : "image";
+    const previewBase64 = String(body.previewBase64 || "").slice(0, 512 * 1024);
     const timestamp = nowIso();
     const item = {
       id: crypto.randomUUID(),
@@ -325,16 +332,30 @@ async function route(request, env) {
       mimeType,
       fileName: String(body.fileName || "珍贵回忆").slice(0, 120),
       byteSize,
+      previewBase64,
       createdAt: timestamp
     };
+    const hasPreview = await albumItemsHasPreviewData(env.DB);
     if (await albumItemsHasInlineData(env.DB)) {
       await env.DB.prepare(
-        "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.createdAt).run();
+        hasPreview
+          ? "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, preview_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          : "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(...(
+        hasPreview
+          ? [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.previewBase64, item.createdAt]
+          : [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.createdAt]
+      )).run();
     } else {
       await env.DB.prepare(
-        "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      ).bind(item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.createdAt).run();
+        hasPreview
+          ? "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, preview_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          : "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(...(
+        hasPreview
+          ? [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.previewBase64, item.createdAt]
+          : [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.createdAt]
+      )).run();
     }
     await insertAlbumChunks(env.DB, item.id, dataBase64);
     return json({ item, quota: { usedBytes: usedBytes + byteSize, limitBytes: ALBUM_QUOTA_BYTES } }, 201);
@@ -343,10 +364,9 @@ async function route(request, env) {
   const albumMatch = pathName.match(/^album\/([^/]+)$/);
   if (albumMatch && request.method === "GET") {
     const hasInlineData = await albumItemsHasInlineData(env.DB);
+    const hasPreview = await albumItemsHasPreviewData(env.DB);
     const item = await env.DB.prepare(
-      hasInlineData
-        ? "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, data_base64 AS inlineDataBase64, created_at AS createdAt FROM album_items WHERE id = ?"
-        : "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items WHERE id = ?"
+      albumItemSelectSql(hasInlineData, hasPreview)
     ).bind(albumMatch[1]).first();
     if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
     item.dataBase64 = await albumData(env.DB, item.id) || item.inlineDataBase64 || "";
@@ -775,6 +795,27 @@ async function albumData(db, itemId) {
 async function albumItemsHasInlineData(db) {
   const { results } = await db.prepare("PRAGMA table_info(album_items)").all();
   return results.some((column) => column.name === "data_base64");
+}
+
+async function albumItemsHasPreviewData(db) {
+  const { results } = await db.prepare("PRAGMA table_info(album_items)").all();
+  if (!results.length) return true;
+  return results.some((column) => column.name === "preview_base64");
+}
+
+function albumItemSelectSql(hasInlineData, hasPreview) {
+  const columns = [
+    "id",
+    "uploader_id AS uploaderId",
+    "media_type AS mediaType",
+    "mime_type AS mimeType",
+    "file_name AS fileName",
+    "byte_size AS byteSize",
+    "created_at AS createdAt"
+  ];
+  if (hasInlineData) columns.push("data_base64 AS inlineDataBase64");
+  if (hasPreview) columns.push("preview_base64 AS previewBase64");
+  return `SELECT ${columns.join(", ")} FROM album_items WHERE id = ?`;
 }
 
 async function personasHasBubbleColor(db) {

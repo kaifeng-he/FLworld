@@ -1,0 +1,1 @@
+ALTER TABLE album_items ADD COLUMN preview_base64 TEXT NOT NULL DEFAULT '';

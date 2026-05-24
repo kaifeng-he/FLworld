@@ -62,6 +62,7 @@ data class AlbumItem(
     val fileName: String,
     val byteSize: Long,
     val createdAt: String,
+    val previewBase64: String? = null,
     val dataBase64: String? = null
 )
 
