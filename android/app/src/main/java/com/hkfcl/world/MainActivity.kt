@@ -669,7 +669,7 @@ private fun CalendarScreen(
                         }
                     },
                     modifier = Modifier.weight(1f)
-                ) { Text(if (editing == null) "保存") else "更新") }
+                ) { Text(if (editing == null) "保存" else "更新") }
                 if (editing != null) {
                     OutlinedButton(onClick = {
                         editing = null
