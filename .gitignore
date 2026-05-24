@@ -1,0 +1,12 @@
+server/data/
+server/.env
+server/node_modules/
+server/.wrangler/
+android/.gradle/
+android/build/
+android/app/build/
+*.apk
+*.aab
+local.properties
+
+note.md
