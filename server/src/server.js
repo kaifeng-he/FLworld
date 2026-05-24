@@ -33,6 +33,7 @@ async function route(request, env) {
 
   const url = new URL(request.url);
   const pathName = trimSlash(url.pathname);
+  await ensureSchema(env.DB);
   await ensureSeedData(env.DB);
 
   if (request.method === "GET" && pathName === "health") {
@@ -250,17 +251,19 @@ async function route(request, env) {
   const calendarMatch = pathName.match(/^calendar\/events\/([^/]+)$/);
   if (calendarMatch && request.method === "PUT") {
     const body = await readJson(request);
+    const current = await env.DB.prepare("SELECT created_by AS createdBy FROM calendar_events WHERE id = ?").bind(calendarMatch[1]).first();
+    if (!current) return json({ error: "not_found", message: "没有找到这个日历事项" }, 404);
     const event = {
       id: calendarMatch[1],
       date: requiredDate(body.date),
       title: requiredString(body.title, "日历标题").slice(0, 60),
       note: String(body.note || "").slice(0, 1000),
+      createdBy: current.createdBy,
       updatedAt: nowIso()
     };
     const result = await env.DB.prepare(
       "UPDATE calendar_events SET date = ?, title = ?, note = ?, updated_at = ? WHERE id = ?"
     ).bind(event.date, event.title, event.note, event.updatedAt, event.id).run();
-    if (!result.meta.changes) return json({ error: "not_found", message: "没有找到这个日历事项" }, 404);
     return json({ event });
   }
 
@@ -299,20 +302,30 @@ async function route(request, env) {
       byteSize,
       createdAt: timestamp
     };
-    await env.DB.prepare(
-      "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.createdAt).run();
+    if (await albumItemsHasInlineData(env.DB)) {
+      await env.DB.prepare(
+        "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.createdAt).run();
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.createdAt).run();
+    }
     await insertAlbumChunks(env.DB, item.id, dataBase64);
     return json({ item, quota: { usedBytes: usedBytes + byteSize, limitBytes: ALBUM_QUOTA_BYTES } }, 201);
   }
 
   const albumMatch = pathName.match(/^album\/([^/]+)$/);
   if (albumMatch && request.method === "GET") {
+    const hasInlineData = await albumItemsHasInlineData(env.DB);
     const item = await env.DB.prepare(
-      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items WHERE id = ?"
+      hasInlineData
+        ? "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, data_base64 AS inlineDataBase64, created_at AS createdAt FROM album_items WHERE id = ?"
+        : "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items WHERE id = ?"
     ).bind(albumMatch[1]).first();
     if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
-    item.dataBase64 = await albumData(env.DB, item.id);
+    item.dataBase64 = await albumData(env.DB, item.id) || item.inlineDataBase64 || "";
+    delete item.inlineDataBase64;
     return json({ item });
   }
 
@@ -344,6 +357,26 @@ async function route(request, env) {
   }
 
   return json({ error: "not_found" }, 404);
+}
+
+async function ensureSchema(db) {
+  await db.batch([
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, author_id TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, read_at TEXT)"
+    ),
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS calendar_events (id TEXT PRIMARY KEY, date TEXT NOT NULL, title TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    ),
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS album_items (id TEXT PRIMARY KEY, uploader_id TEXT NOT NULL, media_type TEXT NOT NULL, mime_type TEXT NOT NULL, file_name TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at TEXT NOT NULL)"
+    ),
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS album_chunks (item_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY (item_id, chunk_index), FOREIGN KEY (item_id) REFERENCES album_items(id) ON DELETE CASCADE)"
+    ),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_calendar_events_date ON calendar_events(date)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_album_items_created_at ON album_items(created_at)")
+  ]);
 }
 
 async function ensureSeedData(db) {
@@ -667,6 +700,11 @@ async function albumData(db, itemId) {
     .bind(itemId)
     .all();
   return results.map((row) => row.dataBase64).join("");
+}
+
+async function albumItemsHasInlineData(db) {
+  const { results } = await db.prepare("PRAGMA table_info(album_items)").all();
+  return results.some((column) => column.name === "data_base64");
 }
 
 function trimSlash(value) {

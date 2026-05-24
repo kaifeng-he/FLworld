@@ -127,6 +127,7 @@ fun WorldApp() {
                 val album = api.album()
                 albumItems = album.first
                 albumQuota = album.second
+                status = ""
             }.onFailure { status = it.message ?: "同步失败" }
         }
     }
@@ -137,6 +138,7 @@ fun WorldApp() {
                 .onSuccess {
                     albumItems = it.first
                     albumQuota = it.second
+                    status = ""
                 }
                 .onFailure { status = it.message ?: "相册同步失败" }
         }
@@ -152,6 +154,7 @@ fun WorldApp() {
             runCatching {
                 api.updateLocation(location.first, location.second)
                 distance = api.distance()
+                status = ""
             }.onFailure { status = it.message ?: "距离更新失败" }
         }
     }
@@ -308,7 +311,10 @@ fun WorldApp() {
                         onCreate = { text ->
                             scope.launch {
                                 runCatching { api.createNote(text) }
-                                    .onSuccess { notes = listOf(it) + notes }
+                                    .onSuccess {
+                                        notes = listOf(it) + notes
+                                        status = ""
+                                    }
                                     .onFailure { status = it.message ?: "留言失败" }
                             }
                         },
@@ -324,7 +330,10 @@ fun WorldApp() {
                         onCreate = { date, title, note ->
                             scope.launch {
                                 runCatching { api.createCalendarEvent(date, title, note) }
-                                    .onSuccess { calendarEvents = (calendarEvents + it).sortedBy { item -> item.date } }
+                                    .onSuccess {
+                                        calendarEvents = (calendarEvents + it).sortedBy { item -> item.date }
+                                        status = ""
+                                    }
                                     .onFailure { status = it.message ?: "保存日历失败" }
                             }
                         },
@@ -333,6 +342,7 @@ fun WorldApp() {
                                 runCatching { api.updateCalendarEvent(id, date, title, note) }
                                     .onSuccess { updated ->
                                         calendarEvents = calendarEvents.map { if (it.id == updated.id) updated else it }.sortedBy { it.date }
+                                        status = ""
                                     }
                                     .onFailure { status = it.message ?: "更新日历失败" }
                             }
@@ -340,7 +350,10 @@ fun WorldApp() {
                         onDelete = { event ->
                             scope.launch {
                                 runCatching { api.deleteCalendarEvent(event.id) }
-                                    .onSuccess { calendarEvents = calendarEvents.filterNot { it.id == event.id } }
+                                    .onSuccess {
+                                        calendarEvents = calendarEvents.filterNot { it.id == event.id }
+                                        status = ""
+                                    }
                                     .onFailure { status = it.message ?: "删除日历失败" }
                             }
                         }
