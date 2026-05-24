@@ -33,18 +33,32 @@ class ApiClient(
                 id = it.getString("id"),
                 name = it.getString("name"),
                 description = it.getString("description"),
-                memory = it.optString("memory")
+                memory = it.optString("memory"),
+                bubbleColor = it.optString("bubbleColor", "#FFE0A8")
             )
         }
     }
 
-    suspend fun createPersona(name: String, description: String, memory: String): Persona {
+    suspend fun createPersona(name: String, description: String, memory: String, bubbleColor: String): Persona {
         val item = request(
             "POST",
             "/bot/personas",
-            JSONObject().put("name", name).put("description", description).put("memory", memory)
+            personaJson(name, description, memory, bubbleColor)
         ).getJSONObject("persona")
-        return Persona(item.getString("id"), item.getString("name"), item.getString("description"), item.optString("memory"))
+        return item.toPersona()
+    }
+
+    suspend fun updatePersona(id: String, name: String, description: String, memory: String, bubbleColor: String): Persona {
+        val item = request(
+            "PUT",
+            "/bot/personas/$id",
+            personaJson(name, description, memory, bubbleColor)
+        ).getJSONObject("persona")
+        return item.toPersona()
+    }
+
+    suspend fun deletePersona(id: String) {
+        request("DELETE", "/bot/personas/$id")
     }
 
     suspend fun sessions(): List<ChatSession> {
@@ -73,6 +87,10 @@ class ApiClient(
             item.getString("createdBy"),
             item.optString("updatedAt")
         )
+    }
+
+    suspend fun deleteSession(id: String) {
+        request("DELETE", "/chat/sessions/$id")
     }
 
     suspend fun messages(sessionId: String): List<ChatMessage> {
@@ -232,6 +250,13 @@ class ApiClient(
     }
 }
 
+private fun personaJson(name: String, description: String, memory: String, bubbleColor: String): JSONObject =
+    JSONObject()
+        .put("name", name)
+        .put("description", description)
+        .put("memory", memory)
+        .put("bubbleColor", bubbleColor)
+
 private fun readEventStream(reader: BufferedReader, onEvent: (String, JSONObject) -> Unit) {
     var event = "message"
     val dataLines = mutableListOf<String>()
@@ -259,6 +284,15 @@ private fun JSONObject.toChatMessage(): ChatMessage =
         senderId = getString("senderId"),
         text = getString("text"),
         createdAt = optString("createdAt")
+    )
+
+private fun JSONObject.toPersona(): Persona =
+    Persona(
+        id = getString("id"),
+        name = getString("name"),
+        description = getString("description"),
+        memory = optString("memory"),
+        bubbleColor = optString("bubbleColor", "#FFE0A8")
     )
 
 private fun JSONObject.toNote(): Note =

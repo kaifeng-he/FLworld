@@ -2,6 +2,7 @@ const DEFAULT_PERSONA_ID = "emotional-support";
 const DEFAULT_SESSION_TITLE = "新的聊天";
 const ALBUM_QUOTA_BYTES = 200 * 1024 * 1024;
 const ALBUM_CHUNK_CHARS = 256 * 1024;
+const DEFAULT_BOT_BUBBLE_COLOR = "#FFE0A8";
 
 const DEFAULT_FEATURES = [
   { id: "distance", title: "距离", status: "ready" },
@@ -13,8 +14,9 @@ const DEFAULT_FEATURES = [
 const DEFAULT_PERSONA = {
   id: DEFAULT_PERSONA_ID,
   name: "温柔情感陪伴",
-  description: "你是锋宝和璐宝的专属情感陪伴机器人。你温柔、真诚、有边界感，会支持、开导、鼓励他们，帮助他们在异地恋和大学生活中更好地表达、理解和陪伴彼此。",
-  memory: "锋宝在广东上大学，璐宝在四川上大学。他们是异地恋情侣。内部账号 hkf 对应锋宝，cl 对应璐宝。"
+  description: "你是恺锋和小璐的专属情感陪伴机器人。你温柔、真诚、有边界感，会支持、开导、鼓励他们，帮助他们在异地恋和大学生活中更好地表达、理解和陪伴彼此。",
+  memory: "恺锋在广东上大学，小璐在四川上大学。他们是异地恋情侣。内部账号 hkf 对应恺锋，cl 对应小璐。",
+  bubbleColor: DEFAULT_BOT_BUBBLE_COLOR
 };
 
 export default {
@@ -60,7 +62,7 @@ async function route(request, env) {
   }
 
   if (request.method === "GET" && pathName === "bot/personas") {
-    const { results } = await env.DB.prepare("SELECT id, name, description, memory FROM personas ORDER BY created_at").all();
+    const { results } = await env.DB.prepare("SELECT id, name, description, memory, bubble_color AS bubbleColor FROM personas ORDER BY created_at").all();
     return json({ personas: results });
   }
 
@@ -70,11 +72,12 @@ async function route(request, env) {
       id: crypto.randomUUID(),
       name: requiredString(body.name, "人格名称"),
       description: requiredString(body.description, "人格描述"),
-      memory: String(body.memory || "")
+      memory: String(body.memory || ""),
+      bubbleColor: normalizeColor(body.bubbleColor)
     };
     await env.DB.prepare(
-      "INSERT INTO personas (id, name, description, memory, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(persona.id, persona.name, persona.description, persona.memory, nowIso(), nowIso()).run();
+      "INSERT INTO personas (id, name, description, memory, bubble_color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(persona.id, persona.name, persona.description, persona.memory, persona.bubbleColor, nowIso(), nowIso()).run();
     return json({ persona }, 201);
   }
 
@@ -85,13 +88,26 @@ async function route(request, env) {
       id: personaMatch[1],
       name: requiredString(body.name, "人格名称"),
       description: requiredString(body.description, "人格描述"),
-      memory: String(body.memory || "")
+      memory: String(body.memory || ""),
+      bubbleColor: normalizeColor(body.bubbleColor)
     };
     const result = await env.DB.prepare(
-      "UPDATE personas SET name = ?, description = ?, memory = ?, updated_at = ? WHERE id = ?"
-    ).bind(persona.name, persona.description, persona.memory, nowIso(), persona.id).run();
+      "UPDATE personas SET name = ?, description = ?, memory = ?, bubble_color = ?, updated_at = ? WHERE id = ?"
+    ).bind(persona.name, persona.description, persona.memory, persona.bubbleColor, nowIso(), persona.id).run();
     if (!result.meta.changes) return json({ error: "not_found" }, 404);
     return json({ persona });
+  }
+
+  if (request.method === "DELETE" && personaMatch) {
+    const personaId = personaMatch[1];
+    if (personaId === DEFAULT_PERSONA_ID) {
+      return json({ error: "default_persona", message: "默认聊天风格不能删除" }, 400);
+    }
+    const current = await findPersona(env.DB, personaId);
+    if (!current) return json({ error: "not_found", message: "没有找到这个聊天风格" }, 404);
+    await env.DB.prepare("UPDATE sessions SET persona_id = ? WHERE persona_id = ?").bind(DEFAULT_PERSONA_ID, personaId).run();
+    await env.DB.prepare("DELETE FROM personas WHERE id = ?").bind(personaId).run();
+    return json({ ok: true });
   }
 
   if (request.method === "GET" && pathName === "chat/sessions") {
@@ -119,6 +135,15 @@ async function route(request, env) {
       "INSERT INTO sessions (id, title, persona_id, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
     ).bind(session.id, session.title, session.personaId, session.createdBy, session.createdAt, session.updatedAt).run();
     return json({ session }, 201);
+  }
+
+  const sessionMatch = pathName.match(/^chat\/sessions\/([^/]+)$/);
+  if (request.method === "DELETE" && sessionMatch) {
+    const session = await findSession(env.DB, sessionMatch[1]);
+    if (!session) return json({ error: "session_not_found", message: "没有找到这个聊天" }, 404);
+    await env.DB.prepare("DELETE FROM messages WHERE session_id = ?").bind(session.id).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(session.id).run();
+    return json({ ok: true });
   }
 
   const messagesMatch = pathName.match(/^chat\/sessions\/([^/]+)\/messages$/);
@@ -372,6 +397,9 @@ async function route(request, env) {
 }
 
 async function ensureSchema(db) {
+  if (!(await personasHasBubbleColor(db))) {
+    await db.prepare(`ALTER TABLE personas ADD COLUMN bubble_color TEXT NOT NULL DEFAULT '${DEFAULT_BOT_BUBBLE_COLOR}'`).run();
+  }
   await db.batch([
     db.prepare(
       "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, author_id TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, read_at TEXT)"
@@ -395,8 +423,10 @@ async function ensureSeedData(db) {
   const persona = await findPersona(db, DEFAULT_PERSONA.id);
   if (!persona) {
     await db.prepare(
-      "INSERT INTO personas (id, name, description, memory, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(DEFAULT_PERSONA.id, DEFAULT_PERSONA.name, DEFAULT_PERSONA.description, DEFAULT_PERSONA.memory, nowIso(), nowIso()).run();
+      "INSERT INTO personas (id, name, description, memory, bubble_color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(DEFAULT_PERSONA.id, DEFAULT_PERSONA.name, DEFAULT_PERSONA.description, DEFAULT_PERSONA.memory, DEFAULT_PERSONA.bubbleColor, nowIso(), nowIso()).run();
+  } else if (!persona.bubbleColor) {
+    await db.prepare("UPDATE personas SET bubble_color = ? WHERE id = ?").bind(DEFAULT_PERSONA.bubbleColor, DEFAULT_PERSONA.id).run();
   }
 
   const existingFeatures = await db.prepare("SELECT COUNT(*) AS count FROM features").first();
@@ -431,7 +461,7 @@ async function createAssistantReply(env, sessionId, personaId) {
     body: JSON.stringify({
       model: env.LLM_MODEL || "deepseek-v4-flash",
       messages: [
-        { role: "system", content: `${persona.description}\n长期记忆：${persona.memory || "暂无"}` },
+        { role: "system", content: assistantSystemPrompt(persona) },
         ...messages
       ],
       temperature: 0.8
@@ -522,7 +552,7 @@ async function streamFromModel(env, session, send) {
     body: JSON.stringify({
       model: env.LLM_MODEL || "deepseek-v4-flash",
       messages: [
-        { role: "system", content: `${persona.description}\n长期记忆：${persona.memory || "暂无"}` },
+        { role: "system", content: assistantSystemPrompt(persona) },
         ...messages
       ],
       temperature: 0.8,
@@ -595,7 +625,7 @@ async function createSessionTitle(env, userText, assistantText) {
 }
 
 async function findPersona(db, id) {
-  return db.prepare("SELECT id, name, description, memory FROM personas WHERE id = ?").bind(id).first();
+  return db.prepare("SELECT id, name, description, memory, bubble_color AS bubbleColor FROM personas WHERE id = ?").bind(id).first();
 }
 
 async function findSession(db, id) {
@@ -682,6 +712,19 @@ function cleanTitle(text) {
     .slice(0, 18);
 }
 
+function assistantSystemPrompt(persona) {
+  return [
+    persona.description,
+    `长期记忆：${persona.memory || "暂无"}`,
+    "称呼规则：内部账号 hkf、cl、HKF、CL 只用于系统识别，回复时绝对不要输出这些账号或缩写。提到两位用户时，只称呼为“恺锋”和“小璐”。"
+  ].join("\n");
+}
+
+function normalizeColor(value) {
+  const text = String(value || "").trim();
+  return /^#[0-9A-Fa-f]{6}$/.test(text) ? text.toUpperCase() : DEFAULT_BOT_BUBBLE_COLOR;
+}
+
 function albumNameWithOriginalExtension(name, originalFileName) {
   const cleanName = name
     .replace(/[\\/:*?"<>|]/g, "")
@@ -734,6 +777,12 @@ async function albumItemsHasInlineData(db) {
   return results.some((column) => column.name === "data_base64");
 }
 
+async function personasHasBubbleColor(db) {
+  const { results } = await db.prepare("PRAGMA table_info(personas)").all();
+  if (!results.length) return true;
+  return results.some((column) => column.name === "bubble_color");
+}
+
 function trimSlash(value) {
   return value.replace(/^\/+|\/+$/g, "");
 }
@@ -748,8 +797,8 @@ function otherUserId(userId) {
 
 function displayName(senderId) {
   if (senderId === "bot") return "机器人";
-  if (senderId === "hkf") return "锋宝";
-  if (senderId === "cl") return "璐宝";
+  if (senderId === "hkf") return "恺锋";
+  if (senderId === "cl") return "小璐";
   return senderId;
 }
 

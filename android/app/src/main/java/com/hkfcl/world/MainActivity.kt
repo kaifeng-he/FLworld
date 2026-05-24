@@ -16,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -45,6 +47,8 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
@@ -65,8 +69,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -116,8 +124,19 @@ fun WorldApp() {
     var calendarEvents by remember { mutableStateOf(emptyList<CalendarEvent>()) }
     var albumItems by remember { mutableStateOf(emptyList<AlbumItem>()) }
     var albumQuota by remember { mutableStateOf<AlbumQuotaState?>(null) }
-    var status by remember { mutableStateOf("") }
+    var loginStatus by remember { mutableStateOf("") }
+    var errorLogs by remember { mutableStateOf(emptyList<String>()) }
+    val snackbarHostState = remember { SnackbarHostState() }
     val api = remember(token) { ApiClient(token) }
+
+    fun report(message: String) {
+        errorLogs = listOf("${timeText(nowIsoText())}  $message") + errorLogs
+        scope.launch { snackbarHostState.showSnackbar(message) }
+    }
+
+    fun notify(message: String) {
+        scope.launch { snackbarHostState.showSnackbar(message) }
+    }
 
     fun refreshAll() {
         scope.launch {
@@ -130,8 +149,7 @@ fun WorldApp() {
                 val album = api.album()
                 albumItems = album.first
                 albumQuota = album.second
-                status = ""
-            }.onFailure { status = it.message ?: "同步失败" }
+            }.onFailure { report(it.message ?: "同步失败") }
         }
     }
 
@@ -141,9 +159,8 @@ fun WorldApp() {
                 .onSuccess {
                     albumItems = it.first
                     albumQuota = it.second
-                    status = ""
                 }
-                .onFailure { status = it.message ?: "相册同步失败" }
+                .onFailure { report(it.message ?: "相册同步失败") }
         }
     }
 
@@ -151,19 +168,18 @@ fun WorldApp() {
         scope.launch {
             val location = locationHelper.currentCoarseLocation()
             if (location == null) {
-                status = "定位暂时不可用，稍后再试试"
+                report("定位暂时不可用，稍后再试试")
                 return@launch
             }
             runCatching {
                 api.updateLocation(location.first, location.second)
                 distance = api.distance()
-                status = ""
-            }.onFailure { status = it.message ?: "距离更新失败" }
+            }.onFailure { report(it.message ?: "距离更新失败") }
         }
     }
 
     val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) syncLocation() else status = "没有定位权限，暂时不能显示距离"
+        if (granted) syncLocation() else report("没有定位权限，暂时不能显示距离")
     }
 
     LaunchedEffect(token) {
@@ -177,7 +193,7 @@ fun WorldApp() {
         LoginScreen(
             selectedUserId = userId,
             code = code,
-            status = status,
+            status = loginStatus,
             onUserId = { userId = it },
             onCode = { code = it },
             onLogin = {
@@ -192,9 +208,9 @@ fun WorldApp() {
                                 .putString("userId", result.second.id)
                                 .putString("userName", result.second.name)
                                 .apply()
-                            status = ""
+                            loginStatus = ""
                         }
-                        .onFailure { status = it.message ?: "登录失败" }
+                        .onFailure { loginStatus = it.message ?: "登录失败" }
                 }
             }
         )
@@ -202,6 +218,7 @@ fun WorldApp() {
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             NavigationBar(containerColor = Color.White) {
                 Tab.entries.forEach { item ->
@@ -225,8 +242,6 @@ fun WorldApp() {
                 .padding(padding)
                 .padding(16.dp)
         ) {
-            AppHeader(status)
-            Spacer(Modifier.height(12.dp))
             when (tab) {
                 Tab.Chat -> ChatScreen(
                     currentUserId = userId,
@@ -240,18 +255,37 @@ fun WorldApp() {
                         scope.launch {
                             runCatching { api.messages(session.id) }
                                 .onSuccess { messages = it }
-                                .onFailure { status = it.message ?: "加载聊天失败" }
+                                .onFailure { report(it.message ?: "加载聊天失败") }
                         }
                     },
                     onBackToSessions = {
                         selectedSession = null
                         messages = emptyList()
                     },
-                    onCreatePersona = { name, desc, memory ->
+                    onCreatePersona = { name, desc, memory, bubbleColor ->
                         scope.launch {
-                            runCatching { api.createPersona(name, desc, memory) }
+                            runCatching { api.createPersona(name, desc, memory, bubbleColor) }
                                 .onSuccess { personas = personas + it }
-                                .onFailure { status = it.message ?: "保存聊天风格失败" }
+                                .onFailure { report(it.message ?: "保存聊天风格失败") }
+                        }
+                    },
+                    onUpdatePersona = { persona, name, desc, memory, bubbleColor ->
+                        scope.launch {
+                            runCatching { api.updatePersona(persona.id, name, desc, memory, bubbleColor) }
+                                .onSuccess { updated ->
+                                    personas = personas.map { if (it.id == updated.id) updated else it }
+                                }
+                                .onFailure { report(it.message ?: "更新聊天风格失败") }
+                        }
+                    },
+                    onDeletePersona = { persona ->
+                        scope.launch {
+                            runCatching { api.deletePersona(persona.id) }
+                                .onSuccess {
+                                    personas = personas.filterNot { it.id == persona.id }
+                                    sessions = api.sessions()
+                                }
+                                .onFailure { report(it.message ?: "删除聊天风格失败") }
                         }
                     },
                     onCreateSession = { personaId ->
@@ -262,14 +296,28 @@ fun WorldApp() {
                                     sessions = listOf(it) + sessions
                                     messages = emptyList()
                                 }
-                                .onFailure { status = it.message ?: "新建聊天失败" }
+                                .onFailure { report(it.message ?: "新建聊天失败") }
+                        }
+                    },
+                    onDeleteSession = { session ->
+                        scope.launch {
+                            runCatching { api.deleteSession(session.id) }
+                                .onSuccess {
+                                    sessions = sessions.filterNot { it.id == session.id }
+                                    if (selectedSession?.id == session.id) {
+                                        selectedSession = null
+                                        messages = emptyList()
+                                    }
+                                }
+                                .onFailure { report(it.message ?: "删除聊天失败") }
                         }
                     },
                     onSend = { text ->
                         val session = selectedSession ?: return@ChatScreen
                         val pendingBotId = "local-bot-${System.currentTimeMillis()}"
-                        messages = messages + ChatMessage("local-user", session.id, "user", userId, text) +
-                            ChatMessage(pendingBotId, session.id, "assistant", "bot", "")
+                        val localTime = nowIsoText()
+                        messages = messages + ChatMessage("local-user-$localTime", session.id, "user", userId, text, localTime) +
+                            ChatMessage(pendingBotId, session.id, "assistant", "bot", "", localTime)
                         scope.launch {
                             runCatching {
                                 api.streamMessage(
@@ -291,7 +339,7 @@ fun WorldApp() {
                                         }
                                     }
                                 )
-                            }.onFailure { status = it.message ?: "发送失败" }
+                            }.onFailure { report(it.message ?: "发送失败") }
                         }
                     }
                 )
@@ -316,9 +364,8 @@ fun WorldApp() {
                                 runCatching { api.createNote(text) }
                                     .onSuccess {
                                         notes = listOf(it) + notes
-                                        status = ""
                                     }
-                                    .onFailure { status = it.message ?: "留言失败" }
+                                    .onFailure { report(it.message ?: "留言失败") }
                             }
                         },
                         onMarkRead = { note ->
@@ -335,9 +382,8 @@ fun WorldApp() {
                                 runCatching { api.createCalendarEvent(date, title, note) }
                                     .onSuccess {
                                         calendarEvents = (calendarEvents + it).sortedBy { item -> item.date }
-                                        status = ""
                                     }
-                                    .onFailure { status = it.message ?: "保存日历失败" }
+                                    .onFailure { report(it.message ?: "保存日历失败") }
                             }
                         },
                         onUpdate = { id, date, title, note ->
@@ -345,9 +391,8 @@ fun WorldApp() {
                                 runCatching { api.updateCalendarEvent(id, date, title, note) }
                                     .onSuccess { updated ->
                                         calendarEvents = calendarEvents.map { if (it.id == updated.id) updated else it }.sortedBy { it.date }
-                                        status = ""
                                     }
-                                    .onFailure { status = it.message ?: "更新日历失败" }
+                                    .onFailure { report(it.message ?: "更新日历失败") }
                             }
                         },
                         onDelete = { event ->
@@ -355,9 +400,8 @@ fun WorldApp() {
                                 runCatching { api.deleteCalendarEvent(event.id) }
                                     .onSuccess {
                                         calendarEvents = calendarEvents.filterNot { it.id == event.id }
-                                        status = ""
                                     }
-                                    .onFailure { status = it.message ?: "删除日历失败" }
+                                    .onFailure { report(it.message ?: "删除日历失败") }
                             }
                         }
                     )
@@ -369,14 +413,14 @@ fun WorldApp() {
                             scope.launch {
                                 runCatching { api.uploadAlbumItem(name, mimeType, bytes, base64) }
                                     .onSuccess { refreshAlbum() }
-                                    .onFailure { status = it.message ?: "上传失败" }
+                                    .onFailure { report(it.message ?: "上传失败") }
                             }
                         },
                         onDelete = { item ->
                             scope.launch {
                                 runCatching { api.deleteAlbumItem(item.id) }
                                     .onSuccess { refreshAlbum() }
-                                    .onFailure { status = it.message ?: "删除失败" }
+                                    .onFailure { report(it.message ?: "删除失败") }
                             }
                         },
                         onRename = { item, name ->
@@ -384,23 +428,22 @@ fun WorldApp() {
                                 runCatching { api.renameAlbumItem(item.id, name) }
                                     .onSuccess { renamed ->
                                         albumItems = albumItems.map { if (it.id == renamed.id) renamed else it }
-                                        status = ""
                                     }
-                                    .onFailure { status = it.message ?: "改名失败" }
+                                    .onFailure { report(it.message ?: "改名失败") }
                             }
                         },
                         onLoadItem = { id, onLoaded ->
                             scope.launch {
                                 runCatching { api.albumItem(id) }
                                     .onSuccess { onLoaded(it) }
-                                    .onFailure { status = it.message ?: "加载失败" }
+                                    .onFailure { report(it.message ?: "加载失败") }
                             }
                         },
                         onSaveImage = { item ->
                             scope.launch {
                                 runCatching { saveImageToGallery(context, item) }
-                                    .onSuccess { status = "已保存到手机相册" }
-                                    .onFailure { status = it.message ?: "保存失败" }
+                                    .onSuccess { notify("已保存到手机相册") }
+                                    .onFailure { report(it.message ?: "保存失败") }
                             }
                         }
                     )
@@ -408,14 +451,7 @@ fun WorldApp() {
 
                 Tab.Mine -> MineScreen(
                     userName = userName,
-                    personas = personas,
-                    onCreatePersona = { name, desc, memory ->
-                        scope.launch {
-                            runCatching { api.createPersona(name, desc, memory) }
-                                .onSuccess { personas = personas + it }
-                                .onFailure { status = it.message ?: "保存聊天风格失败" }
-                        }
-                    },
+                    errorLogs = errorLogs,
                     onLogout = {
                         prefs.edit().clear().apply()
                         token = null
@@ -474,15 +510,6 @@ private fun IdentityButton(text: String, selected: Boolean, modifier: Modifier, 
 }
 
 @Composable
-private fun AppHeader(status: String) {
-    Column {
-        Text("FL小世界", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
-        Text("把想说的话、重要日子和靠近彼此的瞬间放在一起。", color = Color(0xFF6F5F66))
-        if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 6.dp))
-    }
-}
-
-@Composable
 private fun ChatScreen(
     currentUserId: String,
     personas: List<Persona>,
@@ -492,13 +519,20 @@ private fun ChatScreen(
     onRefresh: () -> Unit,
     onSelectSession: (ChatSession) -> Unit,
     onBackToSessions: () -> Unit,
-    onCreatePersona: (String, String, String) -> Unit,
+    onCreatePersona: (String, String, String, String) -> Unit,
+    onUpdatePersona: (Persona, String, String, String, String) -> Unit,
+    onDeletePersona: (Persona) -> Unit,
     onCreateSession: (String) -> Unit,
+    onDeleteSession: (ChatSession) -> Unit,
     onSend: (String) -> Unit
 ) {
     var draft by remember { mutableStateOf("") }
     var selectedPersona by remember(personas) { mutableStateOf(personas.firstOrNull()?.id.orEmpty()) }
     var showPersonaForm by remember { mutableStateOf(false) }
+    var editingPersona by remember { mutableStateOf<Persona?>(null) }
+    var deletingPersona by remember { mutableStateOf<Persona?>(null) }
+    var deletingSession by remember { mutableStateOf<ChatSession?>(null) }
+    val activePersona = selectedSession?.let { session -> personas.firstOrNull { it.id == session.personaId } }
 
     if (selectedSession == null) {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -518,7 +552,46 @@ private fun ChatScreen(
                         OutlinedButton(onClick = { showPersonaForm = !showPersonaForm }) { Text("聊天风格") }
                     }
                     if (showPersonaForm) {
-                        PersonaForm(onCreatePersona)
+                        PersonaForm(
+                            persona = editingPersona,
+                            onSave = { persona, name, desc, memory, color ->
+                                if (persona == null) onCreatePersona(name, desc, memory, color)
+                                else onUpdatePersona(persona, name, desc, memory, color)
+                                editingPersona = null
+                                showPersonaForm = false
+                            },
+                            onCancel = {
+                                editingPersona = null
+                                showPersonaForm = false
+                            }
+                        )
+                    }
+                }
+            }
+            items(personas) { persona ->
+                SectionCard {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Box(
+                            Modifier
+                                .size(24.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(parseColor(persona.bubbleColor))
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(persona.name, fontWeight = FontWeight.SemiBold)
+                            Text(persona.description, color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                        TextButton(onClick = {
+                            editingPersona = persona
+                            showPersonaForm = true
+                        }) { Text("编辑") }
+                        TextButton(
+                            onClick = { deletingPersona = persona },
+                            enabled = persona.id != "emotional-support"
+                        ) { Text("删除") }
                     }
                 }
             }
@@ -527,19 +600,52 @@ private fun ChatScreen(
             }
             items(sessions) { session ->
                 SectionCard(Modifier.clickable { onSelectSession(session) }) {
-                    Text(session.title, fontWeight = FontWeight.SemiBold)
-                    Text("由 ${displayName(session.createdBy)} 创建", color = Color(0xFF766A70))
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) {
+                            Text(session.title, fontWeight = FontWeight.SemiBold)
+                            Text("${dateText(session.updatedAt)} · 由 ${displayName(session.createdBy)} 创建", color = Color(0xFF766A70))
+                        }
+                        TextButton(onClick = { deletingSession = session }) { Text("删除") }
+                    }
                 }
             }
+        }
+        deletingPersona?.let { persona ->
+            ConfirmDialog(
+                title = "删除聊天风格",
+                text = "删除“${persona.name}”后，使用它的历史会话会改回默认风格。",
+                onDismiss = { deletingPersona = null },
+                onConfirm = {
+                    deletingPersona = null
+                    onDeletePersona(persona)
+                }
+            )
+        }
+        deletingSession?.let { session ->
+            ConfirmDialog(
+                title = "删除历史会话",
+                text = "会话“${session.title}”和里面的聊天记录都会删除。",
+                onDismiss = { deletingSession = null },
+                onConfirm = {
+                    deletingSession = null
+                    onDeleteSession(session)
+                }
+            )
         }
         return
     }
 
     Column(Modifier.fillMaxSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             TextButton(onClick = onBackToSessions) { Text("返回") }
+            Text(
+                selectedSession.title,
+                modifier = Modifier.weight(1f),
+                textAlign = TextAlign.Center,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleMedium
+            )
             TextButton(onClick = { onSelectSession(selectedSession) }) { Text("刷新") }
-            Text(selectedSession.title, fontWeight = FontWeight.Bold)
         }
         LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(messages) { message ->
@@ -549,7 +655,13 @@ private fun ChatScreen(
                     mine -> "我"
                     else -> displayName(message.senderId)
                 }
-                MessageBubble(label, message.text.ifBlank { "正在想怎么回复你..." }, mine, message.senderId == "bot")
+                MessageBubble(
+                    label = label,
+                    text = message.text.ifBlank { "正在想怎么回复你..." },
+                    time = timeText(message.createdAt),
+                    alignEnd = mine,
+                    color = messageColor(message.senderId, activePersona?.bubbleColor)
+                )
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -567,22 +679,19 @@ private fun ChatScreen(
 }
 
 @Composable
-private fun MessageBubble(label: String, text: String, mine: Boolean, bot: Boolean) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+private fun MessageBubble(label: String, text: String, time: String, alignEnd: Boolean, color: Color) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start) {
         Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = when {
-                    bot -> Color(0xFFF2EDFF)
-                    mine -> Color(0xFFFFE2EA)
-                    else -> Color.White
-                }
-            ),
+            colors = CardDefaults.cardColors(containerColor = color),
             modifier = Modifier.fillMaxWidth(0.86f)
         ) {
             Column(Modifier.padding(12.dp)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, color = Color(0xFF7C5260))
                 Text(text)
+                if (time.isNotBlank()) {
+                    Text(time, style = MaterialTheme.typography.labelSmall, color = Color(0xFF7B626A), modifier = Modifier.padding(top = 6.dp))
+                }
             }
         }
     }
@@ -662,7 +771,13 @@ private fun NotesScreen(
             items(notes) { note ->
                 LaunchedEffect(note.id) { onMarkRead(note) }
                 val mine = note.authorId == currentUserId
-                MessageBubble(if (mine) "我说的" else "${displayName(note.authorId)}说的", note.text, mine, false)
+                MessageBubble(
+                    label = if (mine) "我说的" else "${displayName(note.authorId)}说的",
+                    text = note.text,
+                    time = timeText(note.createdAt),
+                    alignEnd = mine,
+                    color = messageColor(note.authorId, null)
+                )
             }
         }
     }
@@ -878,28 +993,28 @@ private fun AlbumRow(
 @Composable
 private fun MineScreen(
     userName: String,
-    personas: List<Persona>,
-    onCreatePersona: (String, String, String) -> Unit,
+    errorLogs: List<String>,
     onLogout: () -> Unit
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             SectionCard {
-                Text("我的", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("FL小世界", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("只属于两个人的陪伴、记录和日常。", color = Color(0xFF6F5F66))
+                Spacer(Modifier.height(8.dp))
                 Text("当前身份：$userName", color = Color(0xFF6F5F66))
             }
         }
         item {
             SectionCard {
-                Text("聊天风格", fontWeight = FontWeight.SemiBold)
-                Text("可以给小陪伴增加不同的说话方式。", color = Color(0xFF6F5F66))
-                PersonaForm(onCreatePersona)
-            }
-        }
-        items(personas) { persona ->
-            SectionCard {
-                Text(persona.name, fontWeight = FontWeight.SemiBold)
-                Text(persona.description, color = Color(0xFF6F5F66))
+                Text("错误日志", fontWeight = FontWeight.SemiBold)
+                if (errorLogs.isEmpty()) {
+                    Text("这次打开 App 还没有记录到错误。", color = Color(0xFF6F5F66))
+                } else {
+                    errorLogs.take(20).forEach { log ->
+                        Text(log, color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
+                    }
+                }
             }
         }
         item {
@@ -909,24 +1024,45 @@ private fun MineScreen(
 }
 
 @Composable
-private fun PersonaForm(onCreatePersona: (String, String, String) -> Unit) {
-    var name by remember { mutableStateOf("") }
-    var desc by remember { mutableStateOf("") }
-    var memory by remember { mutableStateOf("") }
+private fun PersonaForm(
+    persona: Persona?,
+    onSave: (Persona?, String, String, String, String) -> Unit,
+    onCancel: () -> Unit
+) {
+    var name by remember(persona?.id) { mutableStateOf(persona?.name.orEmpty()) }
+    var desc by remember(persona?.id) { mutableStateOf(persona?.description.orEmpty()) }
+    var memory by remember(persona?.id) { mutableStateOf(persona?.memory.orEmpty()) }
+    var bubbleColor by remember(persona?.id) { mutableStateOf(persona?.bubbleColor ?: "#FFE0A8") }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
+        Text(if (persona == null) "新建聊天风格" else "编辑聊天风格", fontWeight = FontWeight.SemiBold)
         OutlinedTextField(name, { name = it }, label = { Text("名称") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(desc, { desc = it }, label = { Text("说话风格") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(memory, { memory = it }, label = { Text("需要记住的事") }, modifier = Modifier.fillMaxWidth())
-        Button(
-            onClick = {
-                onCreatePersona(name.trim(), desc.trim(), memory.trim())
-                name = ""
-                desc = ""
-                memory = ""
-            },
-            enabled = name.isNotBlank() && desc.isNotBlank(),
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("保存聊天风格") }
+        Text("机器人消息颜色", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            personaColorOptions().forEach { color ->
+                Box(
+                    Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(parseColor(color))
+                        .border(
+                            width = if (bubbleColor.equals(color, ignoreCase = true)) 2.dp else 1.dp,
+                            color = if (bubbleColor.equals(color, ignoreCase = true)) MaterialTheme.colorScheme.primary else Color(0xFFE0D4D8),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .clickable { bubbleColor = color }
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = { onSave(persona, name.trim(), desc.trim(), memory.trim(), bubbleColor) },
+                enabled = name.isNotBlank() && desc.isNotBlank(),
+                modifier = Modifier.weight(1f)
+            ) { Text("保存") }
+            OutlinedButton(onClick = onCancel) { Text("取消") }
+        }
     }
 }
 
@@ -1000,6 +1136,17 @@ private fun PageTitle(title: String, onBack: () -> Unit) {
 }
 
 @Composable
+private fun ConfirmDialog(title: String, text: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(text) },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("删除") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
 private fun softBrush(): Brush = Brush.verticalGradient(
     listOf(Color(0xFFFFF1F4), Color(0xFFFFFBF8), Color(0xFFF7F2FF))
 )
@@ -1022,6 +1169,53 @@ private fun displayName(userId: String): String = when (userId) {
     "bot" -> "小陪伴"
     else -> userId
 }
+
+private fun messageColor(senderId: String, botColor: String?): Color = when (senderId) {
+    "hkf" -> Color(0xFFDCEBFF)
+    "cl" -> Color(0xFFFFE2EA)
+    "bot" -> parseColor(botColor ?: "#FFE0A8")
+    else -> Color.White
+}
+
+private fun parseColor(value: String): Color {
+    val text = value.trim()
+    if (!Regex("^#[0-9A-Fa-f]{6}$").matches(text)) return Color(0xFFFFE0A8)
+    val rgb = text.removePrefix("#").toLong(16)
+    return Color(0xFF000000L or rgb)
+}
+
+private fun personaColorOptions(): List<String> = listOf(
+    "#FFE0A8",
+    "#FFF1B8",
+    "#DCEBFF",
+    "#FFE2EA",
+    "#E8DDFF",
+    "#DFF5EC"
+)
+
+private fun dateText(value: String): String = formatIso(value, "yyyy-MM-dd")
+
+private fun timeText(value: String): String = formatIso(value, "yyyy-MM-dd HH:mm")
+
+private fun formatIso(value: String, pattern: String): String {
+    val date = parseIso(value) ?: return ""
+    return SimpleDateFormat(pattern, Locale.getDefault()).format(date)
+}
+
+private fun parseIso(value: String): java.util.Date? {
+    if (value.isBlank()) return null
+    val formats = listOf("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", "yyyy-MM-dd'T'HH:mm:ss'Z'")
+    return formats.firstNotNullOfOrNull { pattern ->
+        runCatching {
+            SimpleDateFormat(pattern, Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.parse(value)
+        }.getOrNull()
+    }
+}
+
+private fun nowIsoText(): String =
+    SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }.format(java.util.Date())
 
 private fun distanceText(distance: DistanceState?): String =
     if (distance?.available == true && distance.kilometers != null) "相隔约 ${distance.kilometers} 公里" else "等两个人都打开后显示距离"

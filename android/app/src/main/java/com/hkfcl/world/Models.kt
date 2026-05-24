@@ -6,7 +6,8 @@ data class Persona(
     val id: String,
     val name: String,
     val description: String,
-    val memory: String
+    val memory: String,
+    val bubbleColor: String = "#FFE0A8"
 )
 
 data class ChatSession(
