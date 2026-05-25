@@ -8,8 +8,10 @@ import android.provider.MediaStore
 import android.os.Bundle
 import android.util.Base64
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
@@ -45,6 +47,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -65,7 +68,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.blur
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -85,6 +87,13 @@ import java.util.TimeZone
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            )
+        )
         setContent {
             WorldTheme {
                 WorldApp()
@@ -133,6 +142,9 @@ fun WorldApp() {
     var loginStatus by remember { mutableStateOf("") }
     var errorLogs by remember { mutableStateOf(emptyList<String>()) }
     var backgroundClarity by remember { mutableStateOf(prefs.getFloat(BACKGROUND_CLARITY_KEY, DEFAULT_BACKGROUND_CLARITY)) }
+    var readingOverlayStrength by remember {
+        mutableStateOf(prefs.getFloat(READING_OVERLAY_STRENGTH_KEY, DEFAULT_READING_OVERLAY_STRENGTH))
+    }
     val snackbarHostState = remember { SnackbarHostState() }
     val api = remember(token) { ApiClient(token) }
 
@@ -199,6 +211,7 @@ fun WorldApp() {
     if (token == null) {
         LoginScreen(
             backgroundClarity = backgroundClarity,
+            readingOverlayStrength = readingOverlayStrength,
             selectedUserId = userId,
             code = code,
             status = loginStatus,
@@ -226,9 +239,10 @@ fun WorldApp() {
     }
 
     Scaffold(
+        containerColor = Color.Transparent,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFFF9EAF4).copy(alpha = 0.92f)) {
+            NavigationBar(containerColor = NAVIGATION_BAR_COLOR) {
                 Tab.entries.forEach { item ->
                     NavigationBarItem(
                         selected = tab == item,
@@ -237,13 +251,20 @@ fun WorldApp() {
                             activeWorldPage = null
                         },
                         label = { Text(item.label) },
-                        icon = { Text(tabIcon(item)) }
+                        icon = { Text(tabIcon(item)) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF553561),
+                            selectedTextColor = Color(0xFF553561),
+                            indicatorColor = Color(0xFFEEDCFF),
+                            unselectedIconColor = Color(0xFF695B67),
+                            unselectedTextColor = Color(0xFF695B67)
+                        )
                     )
                 }
             }
         }
     ) { padding ->
-        AppBackground(backgroundClarity) {
+        AppBackground(backgroundClarity, readingOverlayStrength) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -465,6 +486,11 @@ fun WorldApp() {
                         backgroundClarity = clarity
                         prefs.edit().putFloat(BACKGROUND_CLARITY_KEY, clarity).apply()
                     },
+                    readingOverlayStrength = readingOverlayStrength,
+                    onReadingOverlayStrengthChanged = { strength ->
+                        readingOverlayStrength = strength
+                        prefs.edit().putFloat(READING_OVERLAY_STRENGTH_KEY, strength).apply()
+                    },
                     onLogout = {
                         prefs.edit()
                             .remove("token")
@@ -486,6 +512,7 @@ fun WorldApp() {
 @Composable
 private fun LoginScreen(
     backgroundClarity: Float,
+    readingOverlayStrength: Float,
     selectedUserId: String,
     code: String,
     status: String,
@@ -493,7 +520,7 @@ private fun LoginScreen(
     onCode: (String) -> Unit,
     onLogin: () -> Unit
 ) {
-    AppBackground(backgroundClarity) {
+    AppBackground(backgroundClarity, readingOverlayStrength) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -729,10 +756,7 @@ private fun WorldHomeScreen(
     val displayEvents = sortedCalendarEvents(calendarEvents)
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            SectionCard(
-                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(softBrush()),
-                containerColor = Color.Transparent
-            ) {
+            HighlightSectionCard {
                 Text("两个人的小世界", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(distanceText(distance), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
                 TextButton(onClick = onRefreshDistance) { Text("更新距离") }
@@ -917,6 +941,8 @@ private fun MineScreen(
     errorLogs: List<String>,
     backgroundClarity: Float,
     onBackgroundClarityChanged: (Float) -> Unit,
+    readingOverlayStrength: Float,
+    onReadingOverlayStrengthChanged: (Float) -> Unit,
     onLogout: () -> Unit
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -938,7 +964,14 @@ private fun MineScreen(
                     valueRange = 0f..1f,
                     steps = 4
                 )
-                Text("调高会看清更多背景细节，页面仍保留阅读遮罩。", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
+                Text("阅读遮罩：${(readingOverlayStrength * 100).toInt()}%", color = Color(0xFF6F5F66))
+                Slider(
+                    value = readingOverlayStrength,
+                    onValueChange = onReadingOverlayStrengthChanged,
+                    valueRange = 0f..1f,
+                    steps = 4
+                )
+                Text("清晰度调整背景虚化；阅读遮罩可独立调整或完全关闭。", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
             }
         }
         item {
@@ -1093,7 +1126,8 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = FEATURE_CARD_COLOR),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        border = CARD_BORDER,
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
             Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
@@ -1115,45 +1149,55 @@ internal fun SectionCard(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = containerColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        border = CARD_BORDER,
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Column(Modifier.padding(14.dp), content = content)
     }
 }
 
 @Composable
-private fun AppBackground(clarity: Float, content: @Composable () -> Unit) {
+private fun HighlightSectionCard(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(softBrush())
+            .border(CARD_BORDER, RoundedCornerShape(20.dp))
+            .padding(14.dp),
+        content = content
+    )
+}
+
+@Composable
+private fun AppBackground(clarity: Float, readingOverlayStrength: Float, content: @Composable () -> Unit) {
     val adjustedClarity = clarity.coerceIn(0f, 1f)
-    val blurRadius = (34f - adjustedClarity * 18f).dp
+    val adjustedOverlay = readingOverlayStrength.coerceIn(0f, 1f)
+    val blurRadius = (26f * (1f - adjustedClarity)).dp
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        Box(
-            Modifier
+        Image(
+            painter = painterResource(id = R.drawable.background),
+            contentDescription = null,
+            modifier = Modifier
                 .fillMaxSize()
-                .blur(blurRadius)
-                .background(Color.Black)
-        ) {
-            Image(
-                painter = painterResource(id = R.drawable.background),
-                contentDescription = null,
-                modifier = Modifier
+                .blur(blurRadius),
+            contentScale = ContentScale.Crop
+        )
+        if (adjustedOverlay > 0f) {
+            Box(
+                Modifier
                     .fillMaxSize()
-                    .alpha(0.6f + adjustedClarity * 0.18f),
-                contentScale = ContentScale.Fit
-            )
-        }
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            Color(0xFF120D23).copy(alpha = 0.42f - adjustedClarity * 0.2f),
-                            Color(0xFFFAEAF4).copy(alpha = 0.66f - adjustedClarity * 0.2f),
-                            Color(0xFFFFDCEB).copy(alpha = 0.74f - adjustedClarity * 0.2f)
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(
+                                Color(0xFF100C22).copy(alpha = adjustedOverlay * 0.54f),
+                                Color(0xFFF8EAF4).copy(alpha = adjustedOverlay * 0.48f),
+                                Color(0xFFFFDFEC).copy(alpha = adjustedOverlay * 0.6f)
+                            )
                         )
                     )
-                )
-        )
+            )
+        }
         content()
     }
 }
@@ -1166,7 +1210,9 @@ internal fun PageTitle(title: String, onBack: () -> Unit, subtitle: String? = nu
                 .size(44.dp)
                 .clickable(onClick = onBack),
             shape = RoundedCornerShape(15.dp),
-            colors = CardDefaults.cardColors(containerColor = GLASS_CARD_COLOR)
+            colors = CardDefaults.cardColors(containerColor = GLASS_CARD_COLOR),
+            border = CARD_BORDER,
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
         ) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("‹", color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -1195,9 +1241,9 @@ private fun ConfirmDialog(title: String, text: String, onDismiss: () -> Unit, on
 @Composable
 private fun softBrush(): Brush = Brush.verticalGradient(
     listOf(
-        Color(0xFFFFE4F1).copy(alpha = 0.86f),
-        Color(0xFFFFF4F8).copy(alpha = 0.76f),
-        Color(0xFFECE6FF).copy(alpha = 0.8f)
+        Color(0xFFFFE7F2),
+        Color(0xFFFFF6FA),
+        Color(0xFFF0E9FF)
     )
 )
 
@@ -1210,8 +1256,12 @@ private enum class WorldPage {
 private const val DEFAULT_PERSONA_ID = "emotional-support"
 private const val BACKGROUND_CLARITY_KEY = "backgroundClarity"
 private const val DEFAULT_BACKGROUND_CLARITY = 0.45f
-private val GLASS_CARD_COLOR = Color(0xFFFFFBFE).copy(alpha = 0.72f)
-private val FEATURE_CARD_COLOR = Color(0xFFFFF5FB).copy(alpha = 0.76f)
+private const val READING_OVERLAY_STRENGTH_KEY = "readingOverlayStrength"
+private const val DEFAULT_READING_OVERLAY_STRENGTH = 0.55f
+private val GLASS_CARD_COLOR = Color(0xFFFFFAFD)
+private val FEATURE_CARD_COLOR = Color(0xFFFFF7FB)
+private val CARD_BORDER = BorderStroke(1.dp, Color(0xFFEADCE6))
+private val NAVIGATION_BAR_COLOR = Color(0xFFFFF7FB).copy(alpha = 0.96f)
 
 private fun tabIcon(tab: Tab): String = when (tab) {
     Tab.Chat -> "聊"
