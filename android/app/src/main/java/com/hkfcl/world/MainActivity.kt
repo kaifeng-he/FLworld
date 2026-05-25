@@ -1059,25 +1059,31 @@ internal fun SectionCard(
 
 @Composable
 private fun AppBackground(content: @Composable () -> Unit) {
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Image(
-            painter = painterResource(id = R.drawable.app_icon),
-            contentDescription = null,
-            modifier = Modifier
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            Modifier
                 .fillMaxSize()
-                .blur(22.dp)
-                .alpha(0.44f),
-            contentScale = ContentScale.Crop
-        )
+                .blur(26.dp)
+                .background(Color.Black)
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.background),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .alpha(0.68f),
+                contentScale = ContentScale.Fit
+            )
+        }
         Box(
             Modifier
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
                         listOf(
-                            Color(0xFF311C65).copy(alpha = 0.23f),
-                            Color(0xFFFFEFF8).copy(alpha = 0.7f),
-                            Color(0xFFFFDCEB).copy(alpha = 0.76f)
+                            Color(0xFF120D23).copy(alpha = 0.33f),
+                            Color(0xFFFAEAF4).copy(alpha = 0.57f),
+                            Color(0xFFFFDCEB).copy(alpha = 0.65f)
                         )
                     )
                 )
