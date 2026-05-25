@@ -435,18 +435,82 @@ async function createUserMessage(session, user, body, makeSimpleTitle = true) {
 async function createAssistantReply(sessionId, personaId) {
   const persona = await get(collections.personas, personaId) || DEFAULT_PERSONA;
   const history = await messagesForSession(sessionId, 20);
+  if (!process.env.LLM_API_KEY) return fallbackReply();
+
   try {
-    const model = app.ai().createModel("cloudbase");
-    const result = await model.generateText({
-      model: process.env.AI_MODEL || "deepseek-v4-flash",
-      messages: modelMessages(persona, history),
-      temperature: 0.8
+    const response = await fetch(`${llmBaseUrl()}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.LLM_MODEL || "deepseek-v4-flash",
+        messages: modelMessages(persona, history),
+        temperature: 0.8
+      })
     });
-    return result.text?.trim() || fallbackReply();
+    if (!response.ok) {
+      console.error("LLM request failed", response.status, await response.text());
+      return fallbackReply();
+    }
+    const result = await response.json();
+    return result?.choices?.[0]?.message?.content?.trim() || fallbackReply();
   } catch (error) {
-    console.error("AI request failed", error);
+    console.error("LLM request failed", error);
     return fallbackReply();
   }
+}
+
+async function streamFromModel(session, send) {
+  const persona = await get(collections.personas, session.personaId) || DEFAULT_PERSONA;
+  const history = await messagesForSession(session.id, 20);
+  const response = await fetch(`${llmBaseUrl()}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.LLM_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: process.env.LLM_MODEL || "deepseek-v4-flash",
+      messages: modelMessages(persona, history),
+      temperature: 0.8,
+      stream: true
+    })
+  });
+  if (!response.ok || !response.body) {
+    console.error("LLM stream failed", response.status, await response.text());
+    return "";
+  }
+
+  let assistantText = "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const data = JSON.parse(payload);
+        const chunk = data?.choices?.[0]?.delta?.content || "";
+        if (chunk) {
+          assistantText += chunk;
+          send("chunk", { text: chunk });
+        }
+      } catch {
+        // Ignore malformed provider stream fragments.
+      }
+    }
+  }
+  return assistantText;
 }
 
 async function saveAssistantMessage(session, text) {
@@ -474,19 +538,15 @@ async function streamAssistantReply(response, session, userMessage) {
   let assistantText = "";
   try {
     send("user", { message: userMessage });
-    const persona = await get(collections.personas, session.personaId) || DEFAULT_PERSONA;
-    const history = await messagesForSession(session.id, 20);
-    const result = await app.ai().createModel("cloudbase").streamText({
-      model: process.env.AI_MODEL || "deepseek-v4-flash",
-      messages: modelMessages(persona, history),
-      temperature: 0.8
-    });
-    for await (const chunk of result.textStream) {
-      assistantText += chunk;
-      send("chunk", { text: chunk });
+    if (process.env.LLM_API_KEY) {
+      assistantText = await streamFromModel(session, send);
+    }
+    if (!assistantText) {
+      assistantText = fallbackReply();
+      send("chunk", { text: assistantText });
     }
   } catch (error) {
-    console.error("AI stream failed", error);
+    console.error("LLM stream failed", error);
     assistantText = fallbackReply();
     send("chunk", { text: assistantText });
   }
@@ -509,19 +569,33 @@ async function streamAssistantReply(response, session, userMessage) {
 }
 
 async function createSessionTitle(userText, assistantText) {
+  if (!process.env.LLM_API_KEY) return titleFrom(userText);
   try {
-    const result = await app.ai().createModel("cloudbase").generateText({
-      model: process.env.AI_MODEL || "deepseek-v4-flash",
-      messages: [
-        { role: "system", content: "请根据这段对话生成一个简短中文标题，不超过12个字，只输出标题本身。" },
-        { role: "user", content: `用户：${userText}\n助手：${assistantText}` }
-      ],
-      temperature: 0.4
+    const response = await fetch(`${llmBaseUrl()}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.LLM_MODEL || "deepseek-v4-flash",
+        messages: [
+          { role: "system", content: "请根据这段对话生成一个简短中文标题，不超过12个字，只输出标题本身。" },
+          { role: "user", content: `用户：${userText}\n助手：${assistantText}` }
+        ],
+        temperature: 0.4
+      })
     });
-    return cleanTitle(result.text) || titleFrom(userText);
+    if (!response.ok) return titleFrom(userText);
+    const result = await response.json();
+    return cleanTitle(result?.choices?.[0]?.message?.content) || titleFrom(userText);
   } catch {
     return titleFrom(userText);
   }
+}
+
+function llmBaseUrl() {
+  return (process.env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
 }
 
 function modelMessages(persona, history) {

@@ -2,7 +2,7 @@
 
 这是一个只给两个人使用的 Android App。仓库包含：
 
-- `server/`：腾讯云 CloudBase HTTP 云函数后端，负责共享聊天、留言、日历、云存储相册、位置距离和 CloudBase AI 聊天。
+- `server/`：腾讯云 CloudBase HTTP 云函数后端，负责共享聊天、留言、日历、云存储相册、位置距离和 DeepSeek API 代理。
 - `android/`：Kotlin 原生 Android 客户端，使用 Jetpack Compose。
 
 ## 后端运行
@@ -17,7 +17,7 @@ npm run dev
 
 - 云数据库：保存聊天、留言、日历、位置和相册元数据。
 - 云存储：保存相册照片和视频文件。
-- CloudBase AI：提供流式聊天回复。
+- DeepSeek API：由云函数使用你配置的 API Key 提供流式聊天回复。
 
 ## Android 运行
 
