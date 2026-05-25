@@ -10,8 +10,6 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 
-private const val API_BASE_URL = "https://hkf-cl-world.flworld.workers.dev"
-
 class ApiClient(
     private val token: String?
 ) {
@@ -252,7 +250,7 @@ class ApiClient(
         }
 
     private fun openConnection(method: String, path: String, authenticated: Boolean): HttpURLConnection {
-        val connection = URL(API_BASE_URL.trimEnd('/') + path).openConnection() as HttpURLConnection
+        val connection = URL(BuildConfig.API_BASE_URL.trimEnd('/') + path).openConnection() as HttpURLConnection
         connection.requestMethod = method
         connection.setRequestProperty("Accept", "application/json")
         if (authenticated) connection.setRequestProperty("Authorization", "Bearer ${token.orEmpty()}")

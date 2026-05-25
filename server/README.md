@@ -1,59 +1,41 @@
-# Cloudflare Workers 后端
+# CloudBase HTTP 云函数后端
 
-这个后端运行在 Cloudflare Workers，数据存在 D1，Android App 仍然调用同一套 REST API。
+这个后端运行在腾讯云 CloudBase HTTP 云函数中，保留 Android 客户端使用的 REST API 与 SSE 流式聊天协议。
 
-## 本地开发
+## 使用的云服务
+
+- 云数据库：`features`、`personas`、`sessions`、`messages`、`notes`、`calendar_events`、`album_items`、`locations` 集合。
+- 云存储：相册文件存入 `album/` 路径；数据库只保存元数据和预览内容。
+- CloudBase AI：默认模型 `deepseek-v4-flash`，用于聊天回复和新会话标题。
+
+数据不会从旧 Cloudflare D1 自动迁移。新环境首次访问时会自动初始化默认功能和默认聊天风格。
+
+## 环境变量
+
+线上请在 HTTP 云函数配置中设置：
+
+```text
+APP_TOKEN_HKF=替换为随机长字符串
+APP_TOKEN_CL=替换为另一个随机长字符串
+LOGIN_CODE_HKF=锋宝登录口令
+LOGIN_CODE_CL=璐宝登录口令
+AI_MODEL=deepseek-v4-flash
+```
+
+本地运行时复制 `.env.example` 为 `.env`，另需填入 `TCB_ENV_ID`，并按 CloudBase 官方方式配置服务端访问凭据。
+
+## 部署
+
+安装 Node.js 20 以上版本和 CloudBase CLI 后执行：
 
 ```bash
 cd server
 npm install
-npm run d1:migrate:local
-npm run dev
+npm run check
+npx @cloudbase/cli login
+npx @cloudbase/cli fn deploy hkf-cl-world-api --httpFn --dir .
 ```
 
-本地 Worker 默认会给出一个 `http://localhost:8787` 地址。Android 模拟器可以填 `http://10.0.2.2:8787`。
+HTTP 云函数需要启动脚本 `scf_bootstrap`，本目录已包含。部署后在 CloudBase 控制台的 HTTP 访问服务中将该函数绑定到默认 HTTPS 域名，触发路径设为 `/`。
 
-## 部署
-
-1. 登录 Cloudflare：
-
-```bash
-npx wrangler login
-```
-
-2. 创建 D1 数据库：
-
-```bash
-npm run d1:create
-```
-
-3. 把命令输出里的 `database_id` 填到 `wrangler.toml` 的 `database_id`。
-
-4. 初始化远程数据库：
-
-```bash
-npm run d1:migrate
-```
-
-5. 设置 DeepSeek API key：
-
-```bash
-npx wrangler secret put LLM_API_KEY
-```
-
-当前默认模型配置在 `wrangler.toml`：
-
-```toml
-LLM_BASE_URL = "https://api.deepseek.com"
-LLM_MODEL = "deepseek-v4-flash"
-```
-
-也可以按需把 `APP_TOKEN_HKF`、`APP_TOKEN_CL`、`LOGIN_CODE_HKF`、`LOGIN_CODE_CL` 改成更私密的值，或用 `wrangler secret put` 设置。
-
-6. 部署：
-
-```bash
-npm run deploy
-```
-
-Android App 里已经固定线上 Worker 地址，不需要在 App 内填写后端地址。
+完整的控制台配置、Android 配置和排错步骤见根目录 `重新部署和运行教程.md`。

@@ -1,14 +1,18 @@
+import http from "node:http";
+import tcb from "@cloudbase/node-sdk";
+
 const DEFAULT_PERSONA_ID = "emotional-support";
 const DEFAULT_SESSION_TITLE = "新的聊天";
 const ALBUM_QUOTA_BYTES = 200 * 1024 * 1024;
-const ALBUM_CHUNK_CHARS = 256 * 1024;
+const MAX_REQUEST_BYTES = 280 * 1024 * 1024;
 const DEFAULT_BOT_BUBBLE_COLOR = "#FFE0A8";
+const PORT = Number(process.env.PORT || 9000);
 
 const DEFAULT_FEATURES = [
-  { id: "distance", title: "距离", status: "ready" },
-  { id: "notes", title: "我想对你说", status: "ready" },
-  { id: "calendar", title: "日历", status: "ready" },
-  { id: "album", title: "相册", status: "ready" }
+  { id: "distance", title: "距离", status: "ready", sortOrder: 0 },
+  { id: "notes", title: "我想对你说", status: "ready", sortOrder: 1 },
+  { id: "calendar", title: "日历", status: "ready", sortOrder: 2 },
+  { id: "album", title: "相册", status: "ready", sortOrder: 3 }
 ];
 
 const DEFAULT_PERSONA = {
@@ -19,250 +23,229 @@ const DEFAULT_PERSONA = {
   bubbleColor: DEFAULT_BOT_BUBBLE_COLOR
 };
 
-export default {
-  async fetch(request, env) {
-    try {
-      return await route(request, env);
-    } catch (error) {
-      console.error(error);
-      return json({ error: "server_error", message: "服务暂时出了点问题" }, 500);
-    }
-  }
+const app = tcb.init({
+  env: process.env.TCB_ENV_ID || tcb.SYMBOL_DEFAULT_ENV,
+  timeout: 120000
+});
+const db = app.database();
+
+const collections = {
+  features: db.collection("features"),
+  personas: db.collection("personas"),
+  sessions: db.collection("sessions"),
+  messages: db.collection("messages"),
+  notes: db.collection("notes"),
+  calendarEvents: db.collection("calendar_events"),
+  albumItems: db.collection("album_items"),
+  locations: db.collection("locations")
 };
 
-async function route(request, env) {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
+const server = http.createServer(async (request, response) => {
+  try {
+    await route(request, response);
+  } catch (error) {
+    console.error(error);
+    if (!response.headersSent) {
+      sendJson(response, { error: "server_error", message: error.message || "服务暂时出了点问题" }, 500);
+    } else if (!response.writableEnded) {
+      response.end();
+    }
+  }
+});
 
-  const url = new URL(request.url);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`FL小世界 CloudBase API listening on ${PORT}`);
+});
+
+async function route(request, response) {
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, corsHeaders());
+    response.end();
+    return;
+  }
+
+  const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   const pathName = trimSlash(url.pathname);
-  await ensureSchema(env.DB);
-  await ensureSeedData(env.DB);
 
   if (request.method === "GET" && pathName === "health") {
-    return json({ ok: true });
+    sendJson(response, { ok: true });
+    return;
   }
+
+  await ensureSeedData();
 
   if (request.method === "POST" && pathName === "auth/login") {
     const body = await readJson(request);
-    const user = users(env).find((candidate) => candidate.id === body.userId && candidate.code === body.code);
-    if (!user) return json({ error: "invalid_login", message: "登录信息不正确" }, 401);
-    return json({ token: user.token, user: publicUser(user) });
+    const user = users().find((candidate) => candidate.id === body.userId && candidate.code === body.code);
+    if (!user) return sendJson(response, { error: "invalid_login", message: "登录信息不正确" }, 401);
+    return sendJson(response, { token: user.token, user: publicUser(user) });
   }
 
-  const user = requireUser(request, env);
-  if (!user) return json({ error: "unauthorized" }, 401);
+  const user = requireUser(request);
+  if (!user) return sendJson(response, { error: "unauthorized" }, 401);
 
   if (request.method === "GET" && pathName === "me") {
-    return json({ user: publicUser(user) });
+    return sendJson(response, { user: publicUser(user) });
   }
 
   if (request.method === "GET" && pathName === "features") {
-    const { results } = await env.DB.prepare("SELECT id, title, status FROM features ORDER BY sort_order").all();
-    return json({ features: results });
+    const features = await query(collections.features, null, "sortOrder", "asc");
+    return sendJson(response, { features: features.map(publicFeature) });
   }
 
   if (request.method === "GET" && pathName === "bot/personas") {
-    const { results } = await env.DB.prepare("SELECT id, name, description, memory, bubble_color AS bubbleColor FROM personas ORDER BY created_at").all();
-    return json({ personas: results });
+    const personas = await query(collections.personas, null, "createdAt", "asc");
+    return sendJson(response, { personas: personas.map(publicPersona) });
   }
 
   if (request.method === "POST" && pathName === "bot/personas") {
     const body = await readJson(request);
+    const timestamp = nowIso();
     const persona = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       name: requiredString(body.name, "人格名称"),
       description: requiredString(body.description, "人格描述"),
       memory: String(body.memory || ""),
-      bubbleColor: normalizeColor(body.bubbleColor)
+      bubbleColor: normalizeColor(body.bubbleColor),
+      createdAt: timestamp,
+      updatedAt: timestamp
     };
-    await env.DB.prepare(
-      "INSERT INTO personas (id, name, description, memory, bubble_color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(persona.id, persona.name, persona.description, persona.memory, persona.bubbleColor, nowIso(), nowIso()).run();
-    return json({ persona }, 201);
+    await put(collections.personas, persona.id, persona);
+    return sendJson(response, { persona: publicPersona(persona) }, 201);
   }
 
   const personaMatch = pathName.match(/^bot\/personas\/([^/]+)$/);
   if (request.method === "PUT" && personaMatch) {
     if (personaMatch[1] === DEFAULT_PERSONA_ID) {
-      return json({ error: "default_persona", message: "默认聊天风格不能编辑" }, 400);
+      return sendJson(response, { error: "default_persona", message: "默认聊天风格不能编辑" }, 400);
     }
+    const current = await get(collections.personas, personaMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found" }, 404);
     const body = await readJson(request);
     const persona = {
+      ...current,
       id: personaMatch[1],
       name: requiredString(body.name, "人格名称"),
       description: requiredString(body.description, "人格描述"),
       memory: String(body.memory || ""),
-      bubbleColor: normalizeColor(body.bubbleColor)
+      bubbleColor: normalizeColor(body.bubbleColor),
+      updatedAt: nowIso()
     };
-    const result = await env.DB.prepare(
-      "UPDATE personas SET name = ?, description = ?, memory = ?, bubble_color = ?, updated_at = ? WHERE id = ?"
-    ).bind(persona.name, persona.description, persona.memory, persona.bubbleColor, nowIso(), persona.id).run();
-    if (!result.meta.changes) return json({ error: "not_found" }, 404);
-    return json({ persona });
+    await put(collections.personas, persona.id, persona);
+    return sendJson(response, { persona: publicPersona(persona) });
   }
 
   if (request.method === "DELETE" && personaMatch) {
     const personaId = personaMatch[1];
     if (personaId === DEFAULT_PERSONA_ID) {
-      return json({ error: "default_persona", message: "默认聊天风格不能删除" }, 400);
+      return sendJson(response, { error: "default_persona", message: "默认聊天风格不能删除" }, 400);
     }
-    const current = await findPersona(env.DB, personaId);
-    if (!current) return json({ error: "not_found", message: "没有找到这个聊天风格" }, 404);
-    await env.DB.prepare("UPDATE sessions SET persona_id = ? WHERE persona_id = ?").bind(DEFAULT_PERSONA_ID, personaId).run();
-    await env.DB.prepare("DELETE FROM personas WHERE id = ?").bind(personaId).run();
-    return json({ ok: true });
+    if (!(await get(collections.personas, personaId))) {
+      return sendJson(response, { error: "not_found", message: "没有找到这个聊天风格" }, 404);
+    }
+    const sessions = await query(collections.sessions, { personaId });
+    await Promise.all(sessions.map((session) => put(collections.sessions, session.id, { ...session, personaId: DEFAULT_PERSONA_ID })));
+    await collections.personas.doc(personaId).remove();
+    return sendJson(response, { ok: true });
   }
 
   if (request.method === "GET" && pathName === "chat/sessions") {
-    const { results } = await env.DB.prepare(
-      "SELECT id, title, persona_id AS personaId, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC"
-    ).all();
-    return json({ sessions: results });
+    const sessions = await query(collections.sessions, null, "updatedAt", "desc");
+    return sendJson(response, { sessions: sessions.map(publicSession) });
   }
 
   if (request.method === "POST" && pathName === "chat/sessions") {
     const body = await readJson(request);
     const personaId = body.personaId || DEFAULT_PERSONA_ID;
-    const persona = await findPersona(env.DB, personaId);
-    if (!persona) return json({ error: "invalid_persona" }, 400);
+    if (!(await get(collections.personas, personaId))) return sendJson(response, { error: "invalid_persona" }, 400);
     const timestamp = nowIso();
     const session = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       title: String(body.title || DEFAULT_SESSION_TITLE).slice(0, 40),
       personaId,
       createdBy: user.id,
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    await env.DB.prepare(
-      "INSERT INTO sessions (id, title, persona_id, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(session.id, session.title, session.personaId, session.createdBy, session.createdAt, session.updatedAt).run();
-    return json({ session }, 201);
+    await put(collections.sessions, session.id, session);
+    return sendJson(response, { session: publicSession(session) }, 201);
   }
 
   const sessionMatch = pathName.match(/^chat\/sessions\/([^/]+)$/);
   if (request.method === "DELETE" && sessionMatch) {
-    const session = await findSession(env.DB, sessionMatch[1]);
-    if (!session) return json({ error: "session_not_found", message: "没有找到这个聊天" }, 404);
-    await env.DB.prepare("DELETE FROM messages WHERE session_id = ?").bind(session.id).run();
-    await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(session.id).run();
-    return json({ ok: true });
+    if (!(await get(collections.sessions, sessionMatch[1]))) {
+      return sendJson(response, { error: "session_not_found", message: "没有找到这个聊天" }, 404);
+    }
+    await collections.messages.where({ sessionId: sessionMatch[1] }).remove();
+    await collections.sessions.doc(sessionMatch[1]).remove();
+    return sendJson(response, { ok: true });
   }
 
   const messagesMatch = pathName.match(/^chat\/sessions\/([^/]+)\/messages$/);
   if (messagesMatch && request.method === "GET") {
-    const session = await findSession(env.DB, messagesMatch[1]);
-    if (!session) return json({ error: "session_not_found" }, 404);
-    return json({ messages: await messagesForSession(env.DB, session.id) });
+    if (!(await get(collections.sessions, messagesMatch[1]))) return sendJson(response, { error: "session_not_found" }, 404);
+    return sendJson(response, { messages: await messagesForSession(messagesMatch[1]) });
   }
 
   if (messagesMatch && request.method === "POST") {
-    const session = await findSession(env.DB, messagesMatch[1]);
-    if (!session) return json({ error: "session_not_found" }, 404);
-
-    const body = await readJson(request);
-    const text = requiredString(body.text, "消息内容");
-    const timestamp = nowIso();
-    const userMessage = {
-      id: crypto.randomUUID(),
-      sessionId: session.id,
-      role: "user",
-      senderId: user.id,
-      text,
-      createdAt: timestamp
-    };
-    await insertMessage(env.DB, userMessage);
-    if (session.title === DEFAULT_SESSION_TITLE) {
-      await env.DB.prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
-        .bind(titleFrom(text), timestamp, session.id)
-        .run();
-    } else {
-      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").bind(timestamp, session.id).run();
-    }
-
-    const assistantText = await createAssistantReply(env, session.id, session.personaId);
-    const assistantMessage = {
-      id: crypto.randomUUID(),
-      sessionId: session.id,
-      role: "assistant",
-      senderId: "bot",
-      text: assistantText,
-      createdAt: nowIso()
-    };
-    await insertMessage(env.DB, assistantMessage);
-    await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").bind(assistantMessage.createdAt, session.id).run();
-    return json({ messages: [userMessage, assistantMessage] }, 201);
+    const session = await get(collections.sessions, messagesMatch[1]);
+    if (!session) return sendJson(response, { error: "session_not_found" }, 404);
+    const userMessage = await createUserMessage(session, user, await readJson(request));
+    const assistantText = await createAssistantReply(session.id, session.personaId);
+    const assistantMessage = await saveAssistantMessage(session, assistantText);
+    return sendJson(response, { messages: [userMessage, assistantMessage] }, 201);
   }
 
   const streamMatch = pathName.match(/^chat\/sessions\/([^/]+)\/messages\/stream$/);
   if (streamMatch && request.method === "POST") {
-    const session = await findSession(env.DB, streamMatch[1]);
-    if (!session) return json({ error: "session_not_found", message: "没有找到这个聊天" }, 404);
-    const body = await readJson(request);
-    const text = requiredString(body.text, "消息内容");
-    const timestamp = nowIso();
-    const userMessage = {
-      id: crypto.randomUUID(),
-      sessionId: session.id,
-      role: "user",
-      senderId: user.id,
-      text,
-      createdAt: timestamp
-    };
-    await insertMessage(env.DB, userMessage);
-    await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").bind(timestamp, session.id).run();
-    return streamAssistantReply(env, session, userMessage);
+    const session = await get(collections.sessions, streamMatch[1]);
+    if (!session) return sendJson(response, { error: "session_not_found", message: "没有找到这个聊天" }, 404);
+    const userMessage = await createUserMessage(session, user, await readJson(request), false);
+    return streamAssistantReply(response, session, userMessage);
   }
 
   if (request.method === "GET" && pathName === "notes") {
-    const { results } = await env.DB.prepare(
-      "SELECT id, author_id AS authorId, text, created_at AS createdAt, updated_at AS updatedAt, read_at AS readAt FROM notes ORDER BY created_at DESC LIMIT 100"
-    ).all();
-    return json({ notes: results });
+    const notes = await query(collections.notes, null, "createdAt", "desc");
+    return sendJson(response, { notes: notes.map(publicNote) });
   }
 
   if (request.method === "POST" && pathName === "notes") {
     const body = await readJson(request);
     const timestamp = nowIso();
     const note = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       authorId: user.id,
       text: requiredString(body.text, "留言内容").slice(0, 2000),
       createdAt: timestamp,
       updatedAt: timestamp,
       readAt: null
     };
-    await env.DB.prepare(
-      "INSERT INTO notes (id, author_id, text, created_at, updated_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)"
-    ).bind(note.id, note.authorId, note.text, note.createdAt, note.updatedAt).run();
-    return json({ note }, 201);
+    await put(collections.notes, note.id, note);
+    return sendJson(response, { note: publicNote(note) }, 201);
   }
 
   const noteReadMatch = pathName.match(/^notes\/([^/]+)\/read$/);
   if (noteReadMatch && request.method === "POST") {
-    const note = await env.DB.prepare("SELECT author_id AS authorId FROM notes WHERE id = ?").bind(noteReadMatch[1]).first();
-    if (!note) return json({ error: "not_found", message: "没有找到这条留言" }, 404);
-    if (note.authorId !== user.id) {
-      await env.DB.prepare("UPDATE notes SET read_at = COALESCE(read_at, ?) WHERE id = ?").bind(nowIso(), noteReadMatch[1]).run();
+    const note = await get(collections.notes, noteReadMatch[1]);
+    if (!note) return sendJson(response, { error: "not_found", message: "没有找到这条留言" }, 404);
+    if (note.authorId !== user.id && !note.readAt) {
+      await put(collections.notes, note.id, { ...note, readAt: nowIso() });
     }
-    return json({ ok: true });
+    return sendJson(response, { ok: true });
   }
 
   if (request.method === "GET" && pathName === "calendar/events") {
     const month = url.searchParams.get("month");
-    const base = "SELECT id, date, title, note, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM calendar_events";
-    const statement = month
-      ? env.DB.prepare(`${base} WHERE date >= ? AND date < ? ORDER BY date ASC, created_at ASC`).bind(`${month}-01`, nextMonth(month))
-      : env.DB.prepare(`${base} ORDER BY date ASC, created_at ASC`);
-    const { results } = await statement.all();
-    return json({ events: results });
+    let events = await query(collections.calendarEvents, null, "date", "asc");
+    if (month) events = events.filter((event) => event.date >= `${month}-01` && event.date < nextMonth(month));
+    return sendJson(response, { events: events.map(publicCalendarEvent) });
   }
 
   if (request.method === "POST" && pathName === "calendar/events") {
     const body = await readJson(request);
     const timestamp = nowIso();
     const event = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       date: requiredDate(body.date),
       title: requiredString(body.title, "日历标题").slice(0, 60),
       note: String(body.note || "").slice(0, 1000),
@@ -270,150 +253,127 @@ async function route(request, env) {
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    await env.DB.prepare(
-      "INSERT INTO calendar_events (id, date, title, note, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(event.id, event.date, event.title, event.note, event.createdBy, event.createdAt, event.updatedAt).run();
-    return json({ event }, 201);
+    await put(collections.calendarEvents, event.id, event);
+    return sendJson(response, { event: publicCalendarEvent(event) }, 201);
   }
 
   const calendarMatch = pathName.match(/^calendar\/events\/([^/]+)$/);
   if (calendarMatch && request.method === "PUT") {
+    const current = await get(collections.calendarEvents, calendarMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found", message: "没有找到这个日历事项" }, 404);
     const body = await readJson(request);
-    const current = await env.DB.prepare("SELECT created_by AS createdBy FROM calendar_events WHERE id = ?").bind(calendarMatch[1]).first();
-    if (!current) return json({ error: "not_found", message: "没有找到这个日历事项" }, 404);
     const event = {
+      ...current,
       id: calendarMatch[1],
       date: requiredDate(body.date),
       title: requiredString(body.title, "日历标题").slice(0, 60),
       note: String(body.note || "").slice(0, 1000),
-      createdBy: current.createdBy,
       updatedAt: nowIso()
     };
-    const result = await env.DB.prepare(
-      "UPDATE calendar_events SET date = ?, title = ?, note = ?, updated_at = ? WHERE id = ?"
-    ).bind(event.date, event.title, event.note, event.updatedAt, event.id).run();
-    return json({ event });
+    await put(collections.calendarEvents, event.id, event);
+    return sendJson(response, { event: publicCalendarEvent(event) });
   }
 
   if (calendarMatch && request.method === "DELETE") {
-    const result = await env.DB.prepare("DELETE FROM calendar_events WHERE id = ?").bind(calendarMatch[1]).run();
-    if (!result.meta.changes) return json({ error: "not_found", message: "没有找到这个日历事项" }, 404);
-    return json({ ok: true });
+    if (!(await get(collections.calendarEvents, calendarMatch[1]))) {
+      return sendJson(response, { error: "not_found", message: "没有找到这个日历事项" }, 404);
+    }
+    await collections.calendarEvents.doc(calendarMatch[1]).remove();
+    return sendJson(response, { ok: true });
   }
 
   if (request.method === "GET" && pathName === "album") {
-    const { results } = await env.DB.prepare(
-      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
-    ).all();
-    const usedBytes = await albumUsedBytes(env.DB);
-    return json({ items: results, quota: { usedBytes, limitBytes: ALBUM_QUOTA_BYTES } });
+    const items = await query(collections.albumItems, null, "createdAt", "desc");
+    return sendJson(response, {
+      items: items.slice(0, 100).map(publicAlbumItem),
+      quota: { usedBytes: albumUsedBytes(items), limitBytes: ALBUM_QUOTA_BYTES }
+    });
   }
 
   if (request.method === "POST" && pathName === "album") {
     const body = await readJson(request);
     const dataBase64 = requiredString(body.dataBase64, "相册内容");
     const byteSize = Number(body.byteSize);
-    if (!Number.isInteger(byteSize) || byteSize <= 0) return json({ error: "invalid_media", message: "文件大小不正确" }, 400);
-    const usedBytes = await albumUsedBytes(env.DB);
+    if (!Number.isInteger(byteSize) || byteSize <= 0) {
+      return sendJson(response, { error: "invalid_media", message: "文件大小不正确" }, 400);
+    }
+    const fileContent = Buffer.from(dataBase64, "base64");
+    if (fileContent.length !== byteSize) {
+      return sendJson(response, { error: "invalid_media", message: "文件内容和大小不匹配" }, 400);
+    }
+    const currentItems = await query(collections.albumItems);
+    const usedBytes = albumUsedBytes(currentItems);
     if (usedBytes + byteSize > ALBUM_QUOTA_BYTES) {
-      return json({ error: "album_quota_exceeded", message: "相册空间已经不够了，可以先删除一些旧照片或视频" }, 413);
+      return sendJson(response, { error: "album_quota_exceeded", message: "相册空间已经不够了，可以先删除一些旧照片或视频" }, 413);
     }
     const mimeType = String(body.mimeType || "application/octet-stream").slice(0, 120);
-    const mediaType = mimeType.startsWith("video/") ? "video" : "image";
-    const previewBase64 = String(body.previewBase64 || "").slice(0, 512 * 1024);
-    const timestamp = nowIso();
     const item = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       uploaderId: user.id,
-      mediaType,
+      mediaType: mimeType.startsWith("video/") ? "video" : "image",
       mimeType,
       fileName: String(body.fileName || "珍贵回忆").slice(0, 120),
       byteSize,
-      previewBase64,
-      createdAt: timestamp
+      previewBase64: String(body.previewBase64 || "").slice(0, 512 * 1024),
+      createdAt: nowIso()
     };
-    const hasPreview = await albumItemsHasPreviewData(env.DB);
-    if (await albumItemsHasInlineData(env.DB)) {
-      await env.DB.prepare(
-        hasPreview
-          ? "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, preview_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          : "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, data_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(...(
-        hasPreview
-          ? [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.previewBase64, item.createdAt]
-          : [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, dataBase64, item.createdAt]
-      )).run();
-    } else {
-      await env.DB.prepare(
-        hasPreview
-          ? "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, preview_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          : "INSERT INTO album_items (id, uploader_id, media_type, mime_type, file_name, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      ).bind(...(
-        hasPreview
-          ? [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.previewBase64, item.createdAt]
-          : [item.id, item.uploaderId, item.mediaType, item.mimeType, item.fileName, item.byteSize, item.createdAt]
-      )).run();
-    }
-    await insertAlbumChunks(env.DB, item.id, dataBase64);
-    return json({ item, quota: { usedBytes: usedBytes + byteSize, limitBytes: ALBUM_QUOTA_BYTES } }, 201);
+    const upload = await app.uploadFile({
+      cloudPath: `album/${item.id}${fileExtension(item.fileName)}`,
+      fileContent
+    });
+    if (!upload.fileID) throw new Error(upload.message || "上传文件失败");
+    await put(collections.albumItems, item.id, { ...item, fileId: upload.fileID });
+    return sendJson(response, {
+      item: publicAlbumItem(item),
+      quota: { usedBytes: usedBytes + byteSize, limitBytes: ALBUM_QUOTA_BYTES }
+    }, 201);
   }
 
   const albumMatch = pathName.match(/^album\/([^/]+)$/);
   if (albumMatch && request.method === "GET") {
-    const hasInlineData = await albumItemsHasInlineData(env.DB);
-    const hasPreview = await albumItemsHasPreviewData(env.DB);
-    const item = await env.DB.prepare(
-      albumItemSelectSql(hasInlineData, hasPreview)
-    ).bind(albumMatch[1]).first();
-    if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
-    item.dataBase64 = await albumData(env.DB, item.id) || item.inlineDataBase64 || "";
-    delete item.inlineDataBase64;
-    return json({ item });
+    const item = await get(collections.albumItems, albumMatch[1]);
+    if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
+    const file = await app.downloadFile({ fileID: item.fileId });
+    if (!file.fileContent) throw new Error(file.message || "下载文件失败");
+    return sendJson(response, { item: { ...publicAlbumItem(item), dataBase64: file.fileContent.toString("base64") } });
   }
 
   const albumPreviewMatch = pathName.match(/^album\/([^/]+)\/preview$/);
   if (albumPreviewMatch && request.method === "GET") {
-    const item = await env.DB.prepare(
-      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, preview_base64 AS previewBase64, created_at AS createdAt FROM album_items WHERE id = ?"
-    ).bind(albumPreviewMatch[1]).first();
-    if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
-    return json({ item });
+    const item = await get(collections.albumItems, albumPreviewMatch[1]);
+    if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
+    return sendJson(response, { item: publicAlbumItem(item) });
   }
 
   if (albumPreviewMatch && request.method === "PUT") {
-    const current = await env.DB.prepare(
-      "SELECT id, media_type AS mediaType FROM album_items WHERE id = ?"
-    ).bind(albumPreviewMatch[1]).first();
-    if (!current) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
-    if (current.mediaType !== "image") return json({ error: "invalid_media", message: "视频不能写入照片预览" }, 400);
+    const item = await get(collections.albumItems, albumPreviewMatch[1]);
+    if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
+    if (item.mediaType !== "image") return sendJson(response, { error: "invalid_media", message: "视频不能写入照片预览" }, 400);
     const body = await readJson(request);
     const previewBase64 = requiredString(body.previewBase64, "预览图");
     if (previewBase64.length > 512 * 1024) {
-      return json({ error: "preview_too_large", message: "预览图过大" }, 413);
+      return sendJson(response, { error: "preview_too_large", message: "预览图过大" }, 413);
     }
-    await env.DB.prepare("UPDATE album_items SET preview_base64 = ? WHERE id = ?")
-      .bind(previewBase64, current.id)
-      .run();
-    return json({ ok: true });
+    await put(collections.albumItems, item.id, { ...item, previewBase64 });
+    return sendJson(response, { ok: true });
   }
 
   if (albumMatch && request.method === "DELETE") {
-    await env.DB.prepare("DELETE FROM album_chunks WHERE item_id = ?").bind(albumMatch[1]).run();
-    const result = await env.DB.prepare("DELETE FROM album_items WHERE id = ?").bind(albumMatch[1]).run();
-    if (!result.meta.changes) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
-    return json({ ok: true });
+    const item = await get(collections.albumItems, albumMatch[1]);
+    if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
+    await app.deleteFile({ fileList: [item.fileId] });
+    await collections.albumItems.doc(item.id).remove();
+    return sendJson(response, { ok: true });
   }
 
   const albumRenameMatch = pathName.match(/^album\/([^/]+)\/name$/);
   if (albumRenameMatch && request.method === "PUT") {
-    const item = await env.DB.prepare(
-      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items WHERE id = ?"
-    ).bind(albumRenameMatch[1]).first();
-    if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
+    const item = await get(collections.albumItems, albumRenameMatch[1]);
+    if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
     const body = await readJson(request);
-    const nextName = albumNameWithOriginalExtension(requiredString(body.name, "名字"), item.fileName);
-    await env.DB.prepare("UPDATE album_items SET file_name = ? WHERE id = ?").bind(nextName, item.id).run();
-    return json({ item: { ...item, fileName: nextName } });
+    const renamed = { ...item, fileName: albumNameWithOriginalExtension(requiredString(body.name, "名字"), item.fileName) };
+    await put(collections.albumItems, item.id, renamed);
+    return sendJson(response, { item: publicAlbumItem(renamed) });
   }
 
   if (request.method === "POST" && pathName === "location/update") {
@@ -421,310 +381,254 @@ async function route(request, env) {
     const latitude = Number(body.latitude);
     const longitude = Number(body.longitude);
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-      return json({ error: "invalid_location" }, 400);
+      return sendJson(response, { error: "invalid_location" }, 400);
     }
-    await env.DB.prepare(
-      "INSERT INTO locations (user_id, latitude, longitude, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET latitude = excluded.latitude, longitude = excluded.longitude, updated_at = excluded.updated_at"
-    ).bind(user.id, coarse(latitude), coarse(longitude), nowIso()).run();
-    return json({ ok: true });
+    await put(collections.locations, user.id, {
+      id: user.id,
+      userId: user.id,
+      latitude: coarse(latitude),
+      longitude: coarse(longitude),
+      updatedAt: nowIso()
+    });
+    return sendJson(response, { ok: true });
   }
 
   if (request.method === "GET" && pathName === "location/distance") {
-    const mine = await findLocation(env.DB, user.id);
-    const other = await findLocation(env.DB, otherUserId(user.id));
-    if (!mine || !other) return json({ available: false });
-    return json({ available: true, kilometers: roundedKm(distanceKm(mine, other)) });
+    const mine = await get(collections.locations, user.id);
+    const other = await get(collections.locations, otherUserId(user.id));
+    if (!mine || !other) return sendJson(response, { available: false });
+    return sendJson(response, { available: true, kilometers: roundedKm(distanceKm(mine, other)) });
   }
 
-  return json({ error: "not_found" }, 404);
+  return sendJson(response, { error: "not_found" }, 404);
 }
 
-async function ensureSchema(db) {
-  if (!(await personasHasBubbleColor(db))) {
-    await db.prepare(`ALTER TABLE personas ADD COLUMN bubble_color TEXT NOT NULL DEFAULT '${DEFAULT_BOT_BUBBLE_COLOR}'`).run();
+async function ensureSeedData() {
+  if (!(await get(collections.personas, DEFAULT_PERSONA_ID))) {
+    const timestamp = nowIso();
+    await put(collections.personas, DEFAULT_PERSONA_ID, { ...DEFAULT_PERSONA, createdAt: timestamp, updatedAt: timestamp });
   }
-  await db.batch([
-    db.prepare(
-      "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, author_id TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, read_at TEXT)"
-    ),
-    db.prepare(
-      "CREATE TABLE IF NOT EXISTS calendar_events (id TEXT PRIMARY KEY, date TEXT NOT NULL, title TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
-    ),
-    db.prepare(
-      "CREATE TABLE IF NOT EXISTS album_items (id TEXT PRIMARY KEY, uploader_id TEXT NOT NULL, media_type TEXT NOT NULL, mime_type TEXT NOT NULL, file_name TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at TEXT NOT NULL)"
-    ),
-    db.prepare(
-      "CREATE TABLE IF NOT EXISTS album_chunks (item_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, data_base64 TEXT NOT NULL, PRIMARY KEY (item_id, chunk_index), FOREIGN KEY (item_id) REFERENCES album_items(id) ON DELETE CASCADE)"
-    ),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at)"),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_calendar_events_date ON calendar_events(date)"),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_album_items_created_at ON album_items(created_at)")
-  ]);
-  if (!(await albumItemsHasPreviewData(db))) {
-    await db.prepare("ALTER TABLE album_items ADD COLUMN preview_base64 TEXT NOT NULL DEFAULT ''").run();
-  }
-}
-
-async function ensureSeedData(db) {
-  const persona = await findPersona(db, DEFAULT_PERSONA.id);
-  if (!persona) {
-    await db.prepare(
-      "INSERT INTO personas (id, name, description, memory, bubble_color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(DEFAULT_PERSONA.id, DEFAULT_PERSONA.name, DEFAULT_PERSONA.description, DEFAULT_PERSONA.memory, DEFAULT_PERSONA.bubbleColor, nowIso(), nowIso()).run();
-  } else if (!persona.bubbleColor) {
-    await db.prepare("UPDATE personas SET bubble_color = ? WHERE id = ?").bind(DEFAULT_PERSONA.bubbleColor, DEFAULT_PERSONA.id).run();
-  }
-
-  const existingFeatures = await db.prepare("SELECT COUNT(*) AS count FROM features").first();
-  if (!existingFeatures?.count) {
-    const statements = DEFAULT_FEATURES.map((feature, index) =>
-      db.prepare("INSERT INTO features (id, title, status, sort_order) VALUES (?, ?, ?, ?)")
-        .bind(feature.id, feature.title, feature.status, index)
-    );
-    await db.batch(statements);
-  }
-}
-
-async function createAssistantReply(env, sessionId, personaId) {
-  const persona = await findPersona(env.DB, personaId) || DEFAULT_PERSONA;
-  const history = await messagesForSession(env.DB, sessionId, 20);
-  const messages = history.map((message) => ({
-    role: message.role === "assistant" ? "assistant" : "user",
-    content: `${displayName(message.senderId)}：${message.text}`
+  await Promise.all(DEFAULT_FEATURES.map(async (feature) => {
+    if (!(await get(collections.features, feature.id))) await put(collections.features, feature.id, feature);
   }));
-
-  if (!env.LLM_API_KEY) {
-    return "我在这里陪着你们。先慢慢说，不用一下子把所有情绪都整理好；能把感受说出来，本身就已经是在靠近彼此了。";
-  }
-
-  const baseUrl = (env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.LLM_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: env.LLM_MODEL || "deepseek-v4-flash",
-      messages: [
-        { role: "system", content: assistantSystemPrompt(persona) },
-        ...messages
-      ],
-      temperature: 0.8
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    console.error("LLM request failed", response.status, text);
-    return "我刚刚连接模型时有点不顺，但我还是在。你们可以先把想说的话留下来，等服务恢复后我再继续陪你们聊。";
-  }
-
-  const data = await response.json();
-  return data?.choices?.[0]?.message?.content?.trim() || "我听到了，也会继续陪你们把这件事慢慢说清楚。";
 }
 
-function streamAssistantReply(env, session, userMessage) {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      let assistantText = "";
-      const send = (event, data) => {
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
-      try {
-        send("user", { message: userMessage });
-        if (!env.LLM_API_KEY) {
-          const fallback = "我在这里陪着你们。先慢慢说，不用一下子把所有情绪都整理好；能把感受说出来，本身就已经是在靠近彼此了。";
-          for (const chunk of fallback.match(/.{1,8}/gu) || [fallback]) {
-            assistantText += chunk;
-            send("chunk", { text: chunk });
-          }
-        } else {
-          assistantText = await streamFromModel(env, session, send);
-        }
-
-        const assistantMessage = {
-          id: crypto.randomUUID(),
-          sessionId: session.id,
-          role: "assistant",
-          senderId: "bot",
-          text: assistantText.trim() || "我听到了，也会继续陪你们把这件事慢慢说清楚。",
-          createdAt: nowIso()
-        };
-        await insertMessage(env.DB, assistantMessage);
-
-        let title = session.title;
-        if (session.title === DEFAULT_SESSION_TITLE) {
-          title = await createSessionTitle(env, userMessage.text, assistantMessage.text);
-          await env.DB.prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(title, assistantMessage.createdAt, session.id)
-            .run();
-        } else {
-          await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").bind(assistantMessage.createdAt, session.id).run();
-        }
-        send("done", { message: assistantMessage, title });
-      } catch (error) {
-        console.error(error);
-        send("error", { message: "回复生成时出了点问题" });
-      } finally {
-        controller.close();
-      }
-    }
-  });
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-      ...corsHeaders()
-    }
-  });
+async function createUserMessage(session, user, body, makeSimpleTitle = true) {
+  const text = requiredString(body.text, "消息内容");
+  const timestamp = nowIso();
+  const message = {
+    id: randomId(),
+    sessionId: session.id,
+    role: "user",
+    senderId: user.id,
+    text,
+    createdAt: timestamp
+  };
+  await put(collections.messages, message.id, message);
+  const nextTitle = makeSimpleTitle && session.title === DEFAULT_SESSION_TITLE ? titleFrom(text) : session.title;
+  session.title = nextTitle;
+  session.updatedAt = timestamp;
+  await put(collections.sessions, session.id, session);
+  return publicMessage(message);
 }
 
-async function streamFromModel(env, session, send) {
-  const persona = await findPersona(env.DB, session.personaId) || DEFAULT_PERSONA;
-  const history = await messagesForSession(env.DB, session.id, 20);
-  const messages = history.map((message) => ({
-    role: message.role === "assistant" ? "assistant" : "user",
-    content: `${displayName(message.senderId)}：${message.text}`
-  }));
-  const baseUrl = (env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.LLM_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: env.LLM_MODEL || "deepseek-v4-flash",
-      messages: [
-        { role: "system", content: assistantSystemPrompt(persona) },
-        ...messages
-      ],
-      temperature: 0.8,
-      stream: true
-    })
-  });
-  if (!response.ok || !response.body) {
-    const text = await response.text();
-    console.error("LLM stream failed", response.status, text);
-    const fallback = "我刚刚连接模型时有点不顺，但我还是在。你们可以先把想说的话留下来，等服务恢复后我再继续陪你们聊。";
-    send("chunk", { text: fallback });
-    return fallback;
-  }
-
-  let assistantText = "";
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const payload = trimmed.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
-      try {
-        const data = JSON.parse(payload);
-        const chunk = data?.choices?.[0]?.delta?.content || "";
-        if (chunk) {
-          assistantText += chunk;
-          send("chunk", { text: chunk });
-        }
-      } catch {
-        // Ignore malformed provider stream fragments.
-      }
-    }
-  }
-  return assistantText;
-}
-
-async function createSessionTitle(env, userText, assistantText) {
-  if (!env.LLM_API_KEY) return titleFrom(userText);
-  const baseUrl = (env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
+async function createAssistantReply(sessionId, personaId) {
+  const persona = await get(collections.personas, personaId) || DEFAULT_PERSONA;
+  const history = await messagesForSession(sessionId, 20);
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env.LLM_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: env.LLM_MODEL || "deepseek-v4-flash",
-        messages: [
-          { role: "system", content: "请根据这段对话生成一个简短中文标题，不超过12个字，只输出标题本身。" },
-          { role: "user", content: `用户：${userText}\n助手：${assistantText}` }
-        ],
-        temperature: 0.4
-      })
+    const model = app.ai().createModel("cloudbase");
+    const result = await model.generateText({
+      model: process.env.AI_MODEL || "deepseek-v4-flash",
+      messages: modelMessages(persona, history),
+      temperature: 0.8
     });
-    if (!response.ok) return titleFrom(userText);
-    const data = await response.json();
-    return cleanTitle(data?.choices?.[0]?.message?.content) || titleFrom(userText);
+    return result.text?.trim() || fallbackReply();
+  } catch (error) {
+    console.error("AI request failed", error);
+    return fallbackReply();
+  }
+}
+
+async function saveAssistantMessage(session, text) {
+  const message = {
+    id: randomId(),
+    sessionId: session.id,
+    role: "assistant",
+    senderId: "bot",
+    text: text.trim() || fallbackReply(),
+    createdAt: nowIso()
+  };
+  await put(collections.messages, message.id, message);
+  await put(collections.sessions, session.id, { ...session, updatedAt: message.createdAt });
+  return publicMessage(message);
+}
+
+async function streamAssistantReply(response, session, userMessage) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    ...corsHeaders()
+  });
+  const send = (event, data) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  let assistantText = "";
+  try {
+    send("user", { message: userMessage });
+    const persona = await get(collections.personas, session.personaId) || DEFAULT_PERSONA;
+    const history = await messagesForSession(session.id, 20);
+    const result = await app.ai().createModel("cloudbase").streamText({
+      model: process.env.AI_MODEL || "deepseek-v4-flash",
+      messages: modelMessages(persona, history),
+      temperature: 0.8
+    });
+    for await (const chunk of result.textStream) {
+      assistantText += chunk;
+      send("chunk", { text: chunk });
+    }
+  } catch (error) {
+    console.error("AI stream failed", error);
+    assistantText = fallbackReply();
+    send("chunk", { text: assistantText });
+  }
+
+  const assistantMessage = {
+    id: randomId(),
+    sessionId: session.id,
+    role: "assistant",
+    senderId: "bot",
+    text: assistantText.trim() || fallbackReply(),
+    createdAt: nowIso()
+  };
+  await put(collections.messages, assistantMessage.id, assistantMessage);
+  const title = session.title === DEFAULT_SESSION_TITLE
+    ? await createSessionTitle(userMessage.text, assistantMessage.text)
+    : session.title;
+  await put(collections.sessions, session.id, { ...session, title, updatedAt: assistantMessage.createdAt });
+  send("done", { message: publicMessage(assistantMessage), title });
+  response.end();
+}
+
+async function createSessionTitle(userText, assistantText) {
+  try {
+    const result = await app.ai().createModel("cloudbase").generateText({
+      model: process.env.AI_MODEL || "deepseek-v4-flash",
+      messages: [
+        { role: "system", content: "请根据这段对话生成一个简短中文标题，不超过12个字，只输出标题本身。" },
+        { role: "user", content: `用户：${userText}\n助手：${assistantText}` }
+      ],
+      temperature: 0.4
+    });
+    return cleanTitle(result.text) || titleFrom(userText);
   } catch {
     return titleFrom(userText);
   }
 }
 
-async function findPersona(db, id) {
-  return db.prepare("SELECT id, name, description, memory, bubble_color AS bubbleColor FROM personas WHERE id = ?").bind(id).first();
-}
-
-async function findSession(db, id) {
-  return db.prepare(
-    "SELECT id, title, persona_id AS personaId, created_by AS createdBy, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE id = ?"
-  ).bind(id).first();
-}
-
-async function findLocation(db, userId) {
-  return db.prepare("SELECT user_id AS userId, latitude, longitude FROM locations WHERE user_id = ?").bind(userId).first();
-}
-
-async function messagesForSession(db, sessionId, limit = null) {
-  const sql = limit
-    ? "SELECT id, session_id AS sessionId, role, sender_id AS senderId, text, created_at AS createdAt FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
-    : "SELECT id, session_id AS sessionId, role, sender_id AS senderId, text, created_at AS createdAt FROM messages WHERE session_id = ? ORDER BY created_at ASC";
-  const statement = limit ? db.prepare(sql).bind(sessionId, limit) : db.prepare(sql).bind(sessionId);
-  const { results } = await statement.all();
-  return limit ? results.reverse() : results;
-}
-
-async function insertMessage(db, message) {
-  await db.prepare(
-    "INSERT INTO messages (id, session_id, role, sender_id, text, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-  ).bind(message.id, message.sessionId, message.role, message.senderId, message.text, message.createdAt).run();
-}
-
-function requireUser(request, env) {
-  const auth = request.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  return users(env).find((candidate) => candidate.token === token);
-}
-
-function users(env) {
+function modelMessages(persona, history) {
   return [
-    { id: "hkf", name: "锋宝", token: env.APP_TOKEN_HKF || "hkf-local-token", code: env.LOGIN_CODE_HKF || "hkf" },
-    { id: "cl", name: "璐宝", token: env.APP_TOKEN_CL || "cl-local-token", code: env.LOGIN_CODE_CL || "cl" }
+    { role: "system", content: assistantSystemPrompt(persona) },
+    ...history.map((message) => ({
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: `${displayName(message.senderId)}：${message.text}`
+    }))
+  ];
+}
+
+async function messagesForSession(sessionId, limit = null) {
+  const result = await collections.messages.where({ sessionId }).orderBy("createdAt", limit ? "desc" : "asc").limit(limit || 1000).get();
+  const messages = (result.data || []).map(publicMessage);
+  return limit ? messages.reverse() : messages;
+}
+
+async function get(collection, id) {
+  const result = await collection.doc(id).get();
+  return result.data?.[0] || null;
+}
+
+async function put(collection, id, data) {
+  await collection.doc(id).set({ ...withoutDatabaseId(data), id });
+}
+
+async function query(collection, where = null, orderField = null, orderDirection = "asc") {
+  let target = where ? collection.where(where) : collection;
+  if (orderField) target = target.orderBy(orderField, orderDirection);
+  const result = await target.limit(1000).get();
+  return result.data || [];
+}
+
+function withoutDatabaseId(data) {
+  const { _id, ...result } = data;
+  return result;
+}
+
+function publicFeature(item) {
+  return { id: item.id, title: item.title, status: item.status };
+}
+
+function publicPersona(item) {
+  return { id: item.id, name: item.name, description: item.description, memory: item.memory || "", bubbleColor: item.bubbleColor || DEFAULT_BOT_BUBBLE_COLOR };
+}
+
+function publicSession(item) {
+  return { id: item.id, title: item.title, personaId: item.personaId, createdBy: item.createdBy, createdAt: item.createdAt, updatedAt: item.updatedAt };
+}
+
+function publicMessage(item) {
+  return { id: item.id, sessionId: item.sessionId, role: item.role, senderId: item.senderId, text: item.text, createdAt: item.createdAt };
+}
+
+function publicNote(item) {
+  return { id: item.id, authorId: item.authorId, text: item.text, createdAt: item.createdAt, updatedAt: item.updatedAt, readAt: item.readAt || null };
+}
+
+function publicCalendarEvent(item) {
+  return { id: item.id, date: item.date, title: item.title, note: item.note, createdBy: item.createdBy, createdAt: item.createdAt, updatedAt: item.updatedAt };
+}
+
+function publicAlbumItem(item) {
+  return {
+    id: item.id,
+    uploaderId: item.uploaderId,
+    mediaType: item.mediaType,
+    mimeType: item.mimeType,
+    fileName: item.fileName,
+    byteSize: item.byteSize,
+    previewBase64: item.previewBase64 || "",
+    createdAt: item.createdAt
+  };
+}
+
+function requireUser(request) {
+  const auth = request.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  return users().find((candidate) => candidate.token === token);
+}
+
+function users() {
+  return [
+    { id: "hkf", name: "锋宝", token: process.env.APP_TOKEN_HKF || "hkf-local-token", code: process.env.LOGIN_CODE_HKF || "hkf" },
+    { id: "cl", name: "璐宝", token: process.env.APP_TOKEN_CL || "cl-local-token", code: process.env.LOGIN_CODE_CL || "cl" }
   ];
 }
 
 async function readJson(request) {
-  const text = await request.text();
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_REQUEST_BYTES) throw new Error("请求内容太大");
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
 }
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders()
-    }
+function sendJson(response, body, status = 200) {
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    ...corsHeaders()
   });
+  response.end(JSON.stringify(body));
 }
 
 function corsHeaders() {
@@ -733,6 +637,10 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS"
   };
+}
+
+function randomId() {
+  return crypto.randomUUID();
 }
 
 function requiredString(value, label) {
@@ -748,14 +656,11 @@ function requiredDate(value) {
 }
 
 function titleFrom(text) {
-  return text.trim().replace(/\s+/g, " ").slice(0, 18) || "新的聊天";
+  return text.trim().replace(/\s+/g, " ").slice(0, 18) || DEFAULT_SESSION_TITLE;
 }
 
 function cleanTitle(text) {
-  return String(text || "")
-    .replace(/[《》"'“”]/g, "")
-    .trim()
-    .slice(0, 18);
+  return String(text || "").replace(/[《》"'“”]/g, "").trim().slice(0, 18);
 }
 
 function assistantSystemPrompt(persona) {
@@ -766,16 +671,17 @@ function assistantSystemPrompt(persona) {
   ].join("\n");
 }
 
+function fallbackReply() {
+  return "我在这里陪着你们。先慢慢说，不用一下子把所有情绪都整理好；能把感受说出来，本身就已经是在靠近彼此了。";
+}
+
 function normalizeColor(value) {
   const text = String(value || "").trim();
   return /^#[0-9A-Fa-f]{6}$/.test(text) ? text.toUpperCase() : DEFAULT_BOT_BUBBLE_COLOR;
 }
 
 function albumNameWithOriginalExtension(name, originalFileName) {
-  const cleanName = name
-    .replace(/[\\/:*?"<>|]/g, "")
-    .trim()
-    .slice(0, 80);
+  const cleanName = name.replace(/[\\/:*?"<>|]/g, "").trim().slice(0, 80);
   const originalExtension = fileExtension(originalFileName);
   const base = cleanName.replace(/\.[^.]+$/, "") || "珍贵回忆";
   return `${base}${originalExtension}`;
@@ -793,61 +699,8 @@ function nextMonth(month) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-01`;
 }
 
-async function albumUsedBytes(db) {
-  const row = await db.prepare("SELECT COALESCE(SUM(byte_size), 0) AS usedBytes FROM album_items").first();
-  return Number(row?.usedBytes || 0);
-}
-
-async function insertAlbumChunks(db, itemId, dataBase64) {
-  const statements = [];
-  for (let index = 0; index * ALBUM_CHUNK_CHARS < dataBase64.length; index += 1) {
-    statements.push(
-      db.prepare("INSERT INTO album_chunks (item_id, chunk_index, data_base64) VALUES (?, ?, ?)")
-        .bind(itemId, index, dataBase64.slice(index * ALBUM_CHUNK_CHARS, (index + 1) * ALBUM_CHUNK_CHARS))
-    );
-  }
-  for (let index = 0; index < statements.length; index += 50) {
-    await db.batch(statements.slice(index, index + 50));
-  }
-}
-
-async function albumData(db, itemId) {
-  const { results } = await db.prepare("SELECT data_base64 AS dataBase64 FROM album_chunks WHERE item_id = ? ORDER BY chunk_index")
-    .bind(itemId)
-    .all();
-  return results.map((row) => row.dataBase64).join("");
-}
-
-async function albumItemsHasInlineData(db) {
-  const { results } = await db.prepare("PRAGMA table_info(album_items)").all();
-  return results.some((column) => column.name === "data_base64");
-}
-
-async function albumItemsHasPreviewData(db) {
-  const { results } = await db.prepare("PRAGMA table_info(album_items)").all();
-  if (!results.length) return true;
-  return results.some((column) => column.name === "preview_base64");
-}
-
-function albumItemSelectSql(hasInlineData, hasPreview) {
-  const columns = [
-    "id",
-    "uploader_id AS uploaderId",
-    "media_type AS mediaType",
-    "mime_type AS mimeType",
-    "file_name AS fileName",
-    "byte_size AS byteSize",
-    "created_at AS createdAt"
-  ];
-  if (hasInlineData) columns.push("data_base64 AS inlineDataBase64");
-  if (hasPreview) columns.push("preview_base64 AS previewBase64");
-  return `SELECT ${columns.join(", ")} FROM album_items WHERE id = ?`;
-}
-
-async function personasHasBubbleColor(db) {
-  const { results } = await db.prepare("PRAGMA table_info(personas)").all();
-  if (!results.length) return true;
-  return results.some((column) => column.name === "bubble_color");
+function albumUsedBytes(items) {
+  return items.reduce((total, item) => total + Number(item.byteSize || 0), 0);
 }
 
 function trimSlash(value) {
@@ -874,8 +727,7 @@ function coarse(value) {
 }
 
 function roundedKm(value) {
-  if (value < 10) return Math.round(value * 10) / 10;
-  return Math.round(value);
+  return value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
 }
 
 function distanceKm(a, b) {
@@ -884,9 +736,7 @@ function distanceKm(a, b) {
   const dLon = toRad(b.longitude - a.longitude);
   const lat1 = toRad(a.latitude);
   const lat2 = toRad(b.latitude);
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 2 * earthRadius * Math.asin(Math.sqrt(h));
 }
 

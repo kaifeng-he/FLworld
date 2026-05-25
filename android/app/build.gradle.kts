@@ -7,6 +7,8 @@ plugins {
 android {
     namespace = "com.hkfcl.world"
     compileSdk = 35
+    val apiBaseUrl = (project.findProperty("FLWORLD_API_BASE_URL") as String?)
+        ?: "https://replace-with-your-cloudbase-domain.example.com"
 
     defaultConfig {
         applicationId = "com.hkfcl.world"
@@ -14,6 +16,11 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        buildConfigField("String", "API_BASE_URL", "\"$apiBaseUrl\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {

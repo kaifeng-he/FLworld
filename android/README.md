@@ -14,4 +14,10 @@
 android.useAndroidX=true
 ```
 
-App 默认连接线上 Worker，不需要在 App 内填写后端地址。
+App 后端地址通过构建属性配置。在 `gradle.properties` 中增加：
+
+```properties
+FLWORLD_API_BASE_URL=https://你的-cloudbase-默认域名
+```
+
+地址的获得方式见仓库根目录的 `重新部署和运行教程.md`。

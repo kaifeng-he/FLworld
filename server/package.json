@@ -4,15 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "d1:create": "wrangler d1 create hkf-cl-world",
-    "d1:migrate:local": "wrangler d1 migrations apply hkf-cl-world --local",
-    "d1:migrate": "wrangler d1 migrations apply hkf-cl-world --remote",
+    "dev": "node --env-file=.env src/server.js",
+    "deploy": "tcb fn deploy hkf-cl-world-api --httpFn --dir .",
     "check": "node --check src/server.js"
   },
-  "devDependencies": {
-    "wrangler": "^4.18.0"
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.16.0"
   },
   "engines": {
     "node": ">=20"
