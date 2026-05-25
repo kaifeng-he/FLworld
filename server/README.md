@@ -35,8 +35,9 @@ v8 由后端在登录时签发设备会话 token，同一身份的新登录会�
 cd server
 npm install
 npm run check
-npx @cloudbase/cli login
-npx @cloudbase/cli fn deploy hkf-cl-world-api --httpFn --dir .
+npm install -g @cloudbase/cli
+tcb login
+tcb fn deploy hkf-cl-world-api --httpFn --dir .
 ```
 
 HTTP 云函数需要启动脚本 `scf_bootstrap`，本目录已包含。部署后在 CloudBase 控制台的 HTTP 访问服务中将该函数绑定到默认 HTTPS 域名，触发路径设为 `/`。
