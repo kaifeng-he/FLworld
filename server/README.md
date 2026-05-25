@@ -22,6 +22,7 @@ LOGIN_CODE_CL=璐宝登录口令
 LLM_API_KEY=你的DeepSeek API Key
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-v4-flash
+LLM_TIMEOUT_MS=60000
 ```
 
 本地运行时复制 `.env.example` 为 `.env`，另需填入 `TCB_ENV_ID`，并按 CloudBase 官方方式配置服务端访问凭据。
@@ -39,5 +40,7 @@ npx @cloudbase/cli fn deploy hkf-cl-world-api --httpFn --dir .
 ```
 
 HTTP 云函数需要启动脚本 `scf_bootstrap`，本目录已包含。部署后在 CloudBase 控制台的 HTTP 访问服务中将该函数绑定到默认 HTTPS 域名，触发路径设为 `/`。
+
+函数还需要能够主动访问公网：DeepSeek 请求从函数内部发送到 `https://api.deepseek.com`。在函数的网络配置中开启**公网访问**；如果函数也配置了私有网络（VPC），必须选择同时允许公网访问，或为 VPC 配置 NAT 出网。仅给函数绑定公网访问域名不能提供这项出站能力。
 
 完整的控制台配置、Android 配置和排错步骤见根目录 `重新部署和运行教程.md`。

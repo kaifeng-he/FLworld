@@ -7,6 +7,7 @@ const ALBUM_QUOTA_BYTES = 200 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 280 * 1024 * 1024;
 const DEFAULT_BOT_BUBBLE_COLOR = "#FFE0A8";
 const PORT = Number(process.env.PORT || 9000);
+const DEFAULT_LLM_TIMEOUT_MS = 60000;
 
 const DEFAULT_FEATURES = [
   { id: "distance", title: "距离", status: "ready", sortOrder: 0 },
@@ -445,19 +446,20 @@ async function createAssistantReply(sessionId, personaId) {
         Authorization: `Bearer ${process.env.LLM_API_KEY}`
       },
       body: JSON.stringify({
-        model: process.env.LLM_MODEL || "deepseek-v4-flash",
+        model: llmModel(),
         messages: modelMessages(persona, history),
         temperature: 0.8
-      })
+      }),
+      signal: llmRequestSignal()
     });
     if (!response.ok) {
-      console.error("LLM request failed", response.status, await response.text());
+      await logLlmHttpFailure("reply", response);
       return fallbackReply();
     }
     const result = await response.json();
     return result?.choices?.[0]?.message?.content?.trim() || fallbackReply();
   } catch (error) {
-    console.error("LLM request failed", error);
+    logLlmNetworkFailure("reply", error);
     return fallbackReply();
   }
 }
@@ -472,14 +474,15 @@ async function streamFromModel(session, send) {
       Authorization: `Bearer ${process.env.LLM_API_KEY}`
     },
     body: JSON.stringify({
-      model: process.env.LLM_MODEL || "deepseek-v4-flash",
+      model: llmModel(),
       messages: modelMessages(persona, history),
       temperature: 0.8,
       stream: true
-    })
+    }),
+    signal: llmRequestSignal()
   });
   if (!response.ok || !response.body) {
-    console.error("LLM stream failed", response.status, await response.text());
+    await logLlmHttpFailure("stream", response);
     return "";
   }
 
@@ -546,7 +549,7 @@ async function streamAssistantReply(response, session, userMessage) {
       send("chunk", { text: assistantText });
     }
   } catch (error) {
-    console.error("LLM stream failed", error);
+    logLlmNetworkFailure("stream", error);
     assistantText = fallbackReply();
     send("chunk", { text: assistantText });
   }
@@ -578,24 +581,63 @@ async function createSessionTitle(userText, assistantText) {
         Authorization: `Bearer ${process.env.LLM_API_KEY}`
       },
       body: JSON.stringify({
-        model: process.env.LLM_MODEL || "deepseek-v4-flash",
+        model: llmModel(),
         messages: [
           { role: "system", content: "请根据这段对话生成一个简短中文标题，不超过12个字，只输出标题本身。" },
           { role: "user", content: `用户：${userText}\n助手：${assistantText}` }
         ],
         temperature: 0.4
-      })
+      }),
+      signal: llmRequestSignal()
     });
-    if (!response.ok) return titleFrom(userText);
+    if (!response.ok) {
+      await logLlmHttpFailure("title", response);
+      return titleFrom(userText);
+    }
     const result = await response.json();
     return cleanTitle(result?.choices?.[0]?.message?.content) || titleFrom(userText);
-  } catch {
+  } catch (error) {
+    logLlmNetworkFailure("title", error);
     return titleFrom(userText);
   }
 }
 
 function llmBaseUrl() {
   return (process.env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
+}
+
+function llmModel() {
+  return process.env.LLM_MODEL || "deepseek-v4-flash";
+}
+
+function llmRequestSignal() {
+  const configured = Number(process.env.LLM_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_LLM_TIMEOUT_MS;
+  return AbortSignal.timeout(timeoutMs);
+}
+
+async function logLlmHttpFailure(operation, response) {
+  const details = (await response.text()).slice(0, 500);
+  console.error("LLM HTTP failure", {
+    operation,
+    baseUrl: llmBaseUrl(),
+    model: llmModel(),
+    status: response.status,
+    details
+  });
+}
+
+function logLlmNetworkFailure(operation, error) {
+  const cause = error?.cause;
+  console.error("LLM network failure", {
+    operation,
+    baseUrl: llmBaseUrl(),
+    model: llmModel(),
+    name: error?.name,
+    message: error?.message,
+    code: error?.code || cause?.code,
+    cause: cause?.message
+  });
 }
 
 function modelMessages(persona, history) {
