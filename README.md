@@ -15,9 +15,9 @@ npm run dev
 
 线上部署到腾讯云 CloudBase HTTP 云函数，使用 CloudBase 默认 HTTPS 域名即可在国内访问。后端使用：
 
-- 云数据库：保存聊天、留言、日历、位置和相册元数据。
+- 云数据库：保存聊天、留言、日历、位置、相册和双方可编辑的回忆。
 - 云存储：保存相册照片和视频文件。
-- DeepSeek API：由云函数使用你配置的 API Key 提供流式聊天回复。
+- DeepSeek API：由云函数使用你配置的 API Key 提供小暖回复与长期记忆提炼。
 
 ## Android 运行
 
@@ -40,4 +40,4 @@ FLWORLD_API_BASE_URL=https://你的默认域名
 - `hkf`：App 内显示为“锋宝”
 - `cl`：App 内显示为“璐宝”
 
-线上登录口令和 token 通过 CloudBase 云函数环境变量配置，部署前应替换默认值。
+线上登录口令通过 CloudBase 云函数环境变量配置；登录 token 由后端按设备签发，同一身份新登录会替换旧设备。

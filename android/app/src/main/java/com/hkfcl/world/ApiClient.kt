@@ -9,12 +9,14 @@ import java.io.IOException
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 class ApiClient(
-    private val token: String?
+    private val token: String?,
+    private val onSessionReplaced: () -> Unit = {}
 ) {
-    suspend fun login(userId: String, code: String): Pair<String, User> {
-        val json = request("POST", "/auth/login", JSONObject().put("userId", userId).put("code", code), false)
+    suspend fun login(userId: String, code: String, deviceId: String): Pair<String, User> {
+        val json = request("POST", "/auth/login", JSONObject().put("userId", userId).put("code", code).put("deviceId", deviceId), false)
         val user = json.getJSONObject("user")
         return json.getString("token") to User(user.getString("id"), user.getString("name"))
     }
@@ -97,7 +99,11 @@ class ApiClient(
     }
 
     suspend fun sendMessage(sessionId: String, text: String): List<ChatMessage> {
-        val items = request("POST", "/chat/sessions/$sessionId/messages", JSONObject().put("text", text)).getJSONArray("messages")
+        val items = request(
+            "POST",
+            "/chat/sessions/$sessionId/messages",
+            JSONObject().put("text", text).put("requestId", UUID.randomUUID().toString())
+        ).getJSONArray("messages")
         return items.mapObjects { it.toChatMessage() }
     }
 
@@ -112,11 +118,13 @@ class ApiClient(
         connection.doOutput = true
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use {
-            it.write(JSONObject().put("text", text).toString())
+            it.write(JSONObject().put("text", text).put("requestId", UUID.randomUUID().toString()).toString())
         }
         if (connection.responseCode !in 200..299) {
             val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            error(JSONObject(errorText.ifBlank { "{}" }).optString("message", "发送失败"))
+            val errorJson = JSONObject(errorText.ifBlank { "{}" })
+            if (errorJson.optString("error") == "session_replaced") onSessionReplaced()
+            error(errorJson.optString("message", "发送失败"))
         }
         var completed = false
         try {
@@ -138,9 +146,9 @@ class ApiClient(
         }
     }
 
-    suspend fun notes(): List<Note> {
-        val items = request("GET", "/notes").getJSONArray("notes")
-        return items.mapObjects { it.toNote() }
+    suspend fun notes(): NotesState {
+        val json = request("GET", "/notes")
+        return NotesState(json.getJSONArray("notes").mapObjects { it.toNote() }, json.optInt("unreadCount"))
     }
 
     suspend fun createNote(text: String): Note {
@@ -167,17 +175,17 @@ class ApiClient(
         return item.toCalendarEvent()
     }
 
-    suspend fun updateCalendarEvent(id: String, date: String, title: String, note: String): CalendarEvent {
+    suspend fun updateCalendarEvent(id: String, date: String, title: String, note: String, revision: Int): CalendarEvent {
         val item = request(
             "PUT",
             "/calendar/events/$id",
-            JSONObject().put("date", date).put("title", title).put("note", note)
+            JSONObject().put("date", date).put("title", title).put("note", note).put("revision", revision)
         ).getJSONObject("event")
         return item.toCalendarEvent()
     }
 
-    suspend fun deleteCalendarEvent(id: String) {
-        request("DELETE", "/calendar/events/$id")
+    suspend fun deleteCalendarEvent(event: CalendarEvent) {
+        request("DELETE", "/calendar/events/${event.id}", JSONObject().put("revision", event.revision))
     }
 
     suspend fun album(): Pair<List<AlbumItem>, AlbumQuotaState> {
@@ -217,22 +225,60 @@ class ApiClient(
         request("PUT", "/album/$id/preview", JSONObject().put("previewBase64", previewBase64))
     }
 
-    suspend fun renameAlbumItem(id: String, name: String): AlbumItem {
-        val item = request("PUT", "/album/$id/name", JSONObject().put("name", name)).getJSONObject("item")
+    suspend fun renameAlbumItem(id: String, name: String, revision: Int): AlbumItem {
+        val item = request("PUT", "/album/$id/name", JSONObject().put("name", name).put("revision", revision)).getJSONObject("item")
         return item.toAlbumItem()
     }
 
-    suspend fun deleteAlbumItem(id: String) {
-        request("DELETE", "/album/$id")
+    suspend fun deleteAlbumItem(item: AlbumItem) {
+        request("DELETE", "/album/${item.id}", JSONObject().put("revision", item.revision))
     }
 
-    suspend fun updateLocation(latitude: Double, longitude: Double) {
-        request("POST", "/location/update", JSONObject().put("latitude", latitude).put("longitude", longitude))
+    suspend fun updateLocation(latitude: Double, longitude: Double, province: String, city: String) {
+        request("POST", "/location/update", JSONObject().put("latitude", latitude).put("longitude", longitude).put("province", province).put("city", city))
     }
 
     suspend fun distance(): DistanceState {
         val json = request("GET", "/location/distance")
-        return DistanceState(json.optBoolean("available"), if (json.has("kilometers")) json.getDouble("kilometers") else null)
+        return DistanceState(
+            json.optBoolean("available"),
+            if (json.has("kilometers")) json.getDouble("kilometers") else null,
+            json.optJSONObject("mine")?.toLocationSummary(),
+            json.optJSONObject("other")?.toLocationSummary()
+        )
+    }
+
+    suspend fun memoryDocuments(): List<MemoryDocument> =
+        request("GET", "/memories/documents").getJSONArray("documents").mapObjects { it.toMemoryDocument() }
+
+    suspend fun createMemoryDocument(title: String, content: String): MemoryDocument =
+        request("POST", "/memories/documents", JSONObject().put("title", title).put("content", content))
+            .getJSONObject("document").toMemoryDocument()
+
+    suspend fun updateMemoryDocument(document: MemoryDocument, title: String, content: String): MemoryDocument =
+        request(
+            "PUT",
+            "/memories/documents/${document.id}",
+            JSONObject().put("title", title).put("content", content).put("revision", document.revision)
+        ).getJSONObject("document").toMemoryDocument()
+
+    suspend fun deleteMemoryDocument(document: MemoryDocument) {
+        request("DELETE", "/memories/documents/${document.id}", JSONObject().put("revision", document.revision))
+    }
+
+    suspend fun aiMemories(): List<AiMemory> =
+        request("GET", "/memories/ai").getJSONArray("memories").mapObjects { it.toAiMemory() }
+
+    suspend fun updateAiMemory(memory: AiMemory, content: String): AiMemory =
+        request("PUT", "/memories/ai/${memory.id}", JSONObject().put("content", content).put("revision", memory.revision))
+            .getJSONObject("memory").toAiMemory()
+
+    suspend fun deleteAiMemory(memory: AiMemory) {
+        request("DELETE", "/memories/ai/${memory.id}", JSONObject().put("revision", memory.revision))
+    }
+
+    suspend fun generateMaterialMemories(): Int {
+        return request("POST", "/memories/ai/from-materials").optInt("count")
     }
 
     private suspend fun request(method: String, path: String, body: JSONObject? = null, authenticated: Boolean = true): JSONObject =
@@ -245,7 +291,11 @@ class ApiClient(
             }
             val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
             val responseText = stream.bufferedReader().use { it.readText() }
-            if (connection.responseCode !in 200..299) error(JSONObject(responseText).optString("message", "请求失败"))
+            if (connection.responseCode !in 200..299) {
+                val errorJson = JSONObject(responseText.ifBlank { "{}" })
+                if (errorJson.optString("error") == "session_replaced") onSessionReplaced()
+                error(errorJson.optString("message", "请求失败"))
+            }
             JSONObject(responseText)
         }
 
@@ -309,7 +359,8 @@ private fun JSONObject.toNote(): Note =
         authorId = getString("authorId"),
         text = getString("text"),
         createdAt = getString("createdAt"),
-        readAt = optNullableString("readAt")
+        readAt = optNullableString("readAt"),
+        revision = optInt("revision", 1)
     )
 
 private fun JSONObject.toCalendarEvent(): CalendarEvent =
@@ -318,7 +369,8 @@ private fun JSONObject.toCalendarEvent(): CalendarEvent =
         date = getString("date"),
         title = getString("title"),
         note = optString("note"),
-        createdBy = getString("createdBy")
+        createdBy = getString("createdBy"),
+        revision = optInt("revision", 1)
     )
 
 private fun JSONObject.toAlbumItem(): AlbumItem =
@@ -331,7 +383,40 @@ private fun JSONObject.toAlbumItem(): AlbumItem =
         byteSize = getLong("byteSize"),
         createdAt = getString("createdAt"),
         previewBase64 = optNullableString("previewBase64"),
-        dataBase64 = optNullableString("dataBase64")
+        dataBase64 = optNullableString("dataBase64"),
+        revision = optInt("revision", 1)
+    )
+
+private fun JSONObject.toLocationSummary(): LocationSummary =
+    LocationSummary(
+        userId = getString("userId"),
+        name = getString("name"),
+        province = optString("province"),
+        city = optString("city"),
+        updatedAt = optString("updatedAt")
+    )
+
+private fun JSONObject.toMemoryDocument(): MemoryDocument =
+    MemoryDocument(
+        id = getString("id"),
+        title = getString("title"),
+        content = getString("content"),
+        createdBy = getString("createdBy"),
+        createdAt = getString("createdAt"),
+        updatedAt = getString("updatedAt"),
+        revision = optInt("revision", 1)
+    )
+
+private fun JSONObject.toAiMemory(): AiMemory =
+    AiMemory(
+        id = getString("id"),
+        kind = getString("kind"),
+        content = getString("content"),
+        sourceType = optString("sourceType"),
+        generatedAt = optString("generatedAt"),
+        updatedAt = optString("updatedAt"),
+        editedByUser = optBoolean("editedByUser"),
+        revision = optInt("revision", 1)
     )
 
 private fun JSONObject.optNullableString(name: String): String? =

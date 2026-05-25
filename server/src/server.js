@@ -8,6 +8,7 @@ const MAX_REQUEST_BYTES = 280 * 1024 * 1024;
 const DEFAULT_BOT_BUBBLE_COLOR = "#FFE0A8";
 const PORT = Number(process.env.PORT || 9000);
 const DEFAULT_LLM_TIMEOUT_MS = 60000;
+const MAX_MEMORY_SOURCE_CHARS = 40000;
 
 const DEFAULT_FEATURES = [
   { id: "distance", title: "距离", status: "ready", sortOrder: 0 },
@@ -38,7 +39,11 @@ const collections = {
   notes: db.collection("notes"),
   calendarEvents: db.collection("calendar_events"),
   albumItems: db.collection("album_items"),
-  locations: db.collection("locations")
+  locations: db.collection("locations"),
+  authSessions: db.collection("auth_sessions"),
+  memoryDocuments: db.collection("memory_documents"),
+  aiMemories: db.collection("ai_memories"),
+  chatRequests: db.collection("chat_requests")
 };
 
 const server = http.createServer(async (request, response) => {
@@ -79,11 +84,27 @@ async function route(request, response) {
     const body = await readJson(request);
     const user = users().find((candidate) => candidate.id === body.userId && candidate.code === body.code);
     if (!user) return sendJson(response, { error: "invalid_login", message: "登录信息不正确" }, 401);
-    return sendJson(response, { token: user.token, user: publicUser(user) });
+    const timestamp = nowIso();
+    const token = `${user.id}.${randomId()}`;
+    await put(collections.authSessions, user.id, {
+      id: user.id,
+      userId: user.id,
+      deviceId: requiredString(body.deviceId, "设备信息").slice(0, 120),
+      token,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    return sendJson(response, { token, user: publicUser(user) });
   }
 
-  const user = requireUser(request);
-  if (!user) return sendJson(response, { error: "unauthorized" }, 401);
+  const user = await requireUser(request);
+  if (!user) {
+    const hasToken = String(request.headers.authorization || "").startsWith("Bearer ");
+    return sendJson(response, {
+      error: hasToken ? "session_replaced" : "unauthorized",
+      message: hasToken ? "该身份已在另一台设备登录，请重新进入小世界" : "请先登录"
+    }, 401);
+  }
 
   if (request.method === "GET" && pathName === "me") {
     return sendJson(response, { user: publicUser(user) });
@@ -189,25 +210,56 @@ async function route(request, response) {
   }
 
   if (messagesMatch && request.method === "POST") {
-    const session = await get(collections.sessions, messagesMatch[1]);
+    let session = await get(collections.sessions, messagesMatch[1]);
     if (!session) return sendJson(response, { error: "session_not_found" }, 404);
-    const userMessage = await createUserMessage(session, user, await readJson(request));
-    const assistantText = await createAssistantReply(session.id, session.personaId);
-    const assistantMessage = await saveAssistantMessage(session, assistantText);
-    return sendJson(response, { messages: [userMessage, assistantMessage] }, 201);
+    const body = await readJson(request);
+    const duplicate = await existingChatRequest(body.requestId);
+    if (duplicate) return sendJson(response, { error: "duplicate_request", message: "这条消息已经发送过了" }, 409);
+    try {
+      session = await acquireChatReplyLock(session.id);
+    } catch (error) {
+      if (error.code === "reply_in_progress") return sendJson(response, { error: error.code, message: error.message }, 409);
+      throw error;
+    }
+    try {
+      const userMessage = await createUserMessage(session, user, body);
+      await recordChatRequest(body.requestId, session.id, userMessage.id);
+      const assistantText = await createAssistantReply(session.id, session.personaId);
+      const assistantMessage = await saveAssistantMessage(session, assistantText);
+      void considerChatMemory(session.id).catch((error) => logLlmNetworkFailure("memory", error));
+      return sendJson(response, { messages: [userMessage, assistantMessage] }, 201);
+    } finally {
+      await releaseChatReplyLock(session.id);
+    }
   }
 
   const streamMatch = pathName.match(/^chat\/sessions\/([^/]+)\/messages\/stream$/);
   if (streamMatch && request.method === "POST") {
-    const session = await get(collections.sessions, streamMatch[1]);
+    let session = await get(collections.sessions, streamMatch[1]);
     if (!session) return sendJson(response, { error: "session_not_found", message: "没有找到这个聊天" }, 404);
-    const userMessage = await createUserMessage(session, user, await readJson(request), false);
-    return streamAssistantReply(response, session, userMessage);
+    const body = await readJson(request);
+    const duplicate = await existingChatRequest(body.requestId);
+    if (duplicate) return sendJson(response, { error: "duplicate_request", message: "这条消息已经发送过了" }, 409);
+    try {
+      session = await acquireChatReplyLock(session.id);
+    } catch (error) {
+      if (error.code === "reply_in_progress") return sendJson(response, { error: error.code, message: error.message }, 409);
+      throw error;
+    }
+    try {
+      const userMessage = await createUserMessage(session, user, body, false);
+      await recordChatRequest(body.requestId, session.id, userMessage.id);
+      return await streamAssistantReply(response, session, userMessage);
+    } catch (error) {
+      await releaseChatReplyLock(session.id);
+      throw error;
+    }
   }
 
   if (request.method === "GET" && pathName === "notes") {
     const notes = await query(collections.notes, null, "createdAt", "desc");
-    return sendJson(response, { notes: notes.map(publicNote) });
+    const unreadCount = notes.filter((note) => note.authorId !== user.id && !note.readAt).length;
+    return sendJson(response, { notes: notes.map(publicNote), unreadCount });
   }
 
   if (request.method === "POST" && pathName === "notes") {
@@ -219,7 +271,8 @@ async function route(request, response) {
       text: requiredString(body.text, "留言内容").slice(0, 2000),
       createdAt: timestamp,
       updatedAt: timestamp,
-      readAt: null
+      readAt: null,
+      revision: 1
     };
     await put(collections.notes, note.id, note);
     return sendJson(response, { note: publicNote(note) }, 201);
@@ -252,7 +305,8 @@ async function route(request, response) {
       note: String(body.note || "").slice(0, 1000),
       createdBy: user.id,
       createdAt: timestamp,
-      updatedAt: timestamp
+      updatedAt: timestamp,
+      revision: 1
     };
     await put(collections.calendarEvents, event.id, event);
     return sendJson(response, { event: publicCalendarEvent(event) }, 201);
@@ -263,22 +317,27 @@ async function route(request, response) {
     const current = await get(collections.calendarEvents, calendarMatch[1]);
     if (!current) return sendJson(response, { error: "not_found", message: "没有找到这个日历事项" }, 404);
     const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicCalendarEvent(current));
     const event = {
       ...current,
       id: calendarMatch[1],
       date: requiredDate(body.date),
       title: requiredString(body.title, "日历标题").slice(0, 60),
       note: String(body.note || "").slice(0, 1000),
-      updatedAt: nowIso()
+      updatedAt: nowIso(),
+      revision: nextRevision(current)
     };
     await put(collections.calendarEvents, event.id, event);
     return sendJson(response, { event: publicCalendarEvent(event) });
   }
 
   if (calendarMatch && request.method === "DELETE") {
-    if (!(await get(collections.calendarEvents, calendarMatch[1]))) {
+    const current = await get(collections.calendarEvents, calendarMatch[1]);
+    if (!current) {
       return sendJson(response, { error: "not_found", message: "没有找到这个日历事项" }, 404);
     }
+    const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicCalendarEvent(current));
     await collections.calendarEvents.doc(calendarMatch[1]).remove();
     return sendJson(response, { ok: true });
   }
@@ -286,7 +345,7 @@ async function route(request, response) {
   if (request.method === "GET" && pathName === "album") {
     const items = await query(collections.albumItems, null, "createdAt", "desc");
     return sendJson(response, {
-      items: items.slice(0, 100).map(publicAlbumItem),
+      items: items.filter((item) => item.fileId).slice(0, 100).map(publicAlbumItem),
       quota: { usedBytes: albumUsedBytes(items), limitBytes: ALBUM_QUOTA_BYTES }
     });
   }
@@ -302,11 +361,6 @@ async function route(request, response) {
     if (fileContent.length !== byteSize) {
       return sendJson(response, { error: "invalid_media", message: "文件内容和大小不匹配" }, 400);
     }
-    const currentItems = await query(collections.albumItems);
-    const usedBytes = albumUsedBytes(currentItems);
-    if (usedBytes + byteSize > ALBUM_QUOTA_BYTES) {
-      return sendJson(response, { error: "album_quota_exceeded", message: "相册空间已经不够了，可以先删除一些旧照片或视频" }, 413);
-    }
     const mimeType = String(body.mimeType || "application/octet-stream").slice(0, 120);
     const item = {
       id: randomId(),
@@ -316,14 +370,38 @@ async function route(request, response) {
       fileName: String(body.fileName || "珍贵回忆").slice(0, 120),
       byteSize,
       previewBase64: String(body.previewBase64 || "").slice(0, 512 * 1024),
-      createdAt: nowIso()
+      createdAt: nowIso(),
+      revision: 1
     };
-    const upload = await app.uploadFile({
-      cloudPath: `album/${item.id}${fileExtension(item.fileName)}`,
-      fileContent
-    });
-    if (!upload.fileID) throw new Error(upload.message || "上传文件失败");
-    await put(collections.albumItems, item.id, { ...item, fileId: upload.fileID });
+    let usedBytes = 0;
+    try {
+      await db.runTransaction(async (transaction) => {
+        const result = await transaction.collection("album_items").limit(1000).get();
+        usedBytes = albumUsedBytes(result.data || []);
+        if (usedBytes + byteSize > ALBUM_QUOTA_BYTES) {
+          const error = new Error("相册空间已经不够了，可以先删除一些旧照片或视频");
+          error.code = "album_quota_exceeded";
+          throw error;
+        }
+        await transaction.collection("album_items").doc(item.id).set({ ...item, id: item.id, uploadPending: true });
+      });
+    } catch (error) {
+      if (error.code === "album_quota_exceeded") {
+        return sendJson(response, { error: error.code, message: error.message }, 413);
+      }
+      throw error;
+    }
+    try {
+      const upload = await app.uploadFile({
+        cloudPath: `album/${item.id}${fileExtension(item.fileName)}`,
+        fileContent
+      });
+      if (!upload.fileID) throw new Error(upload.message || "上传文件失败");
+      await put(collections.albumItems, item.id, { ...item, fileId: upload.fileID });
+    } catch (error) {
+      await collections.albumItems.doc(item.id).remove();
+      throw error;
+    }
     return sendJson(response, {
       item: publicAlbumItem(item),
       quota: { usedBytes: usedBytes + byteSize, limitBytes: ALBUM_QUOTA_BYTES }
@@ -362,6 +440,8 @@ async function route(request, response) {
   if (albumMatch && request.method === "DELETE") {
     const item = await get(collections.albumItems, albumMatch[1]);
     if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
+    const body = await readJson(request);
+    if (!matchesRevision(item, body.revision)) return conflict(response, publicAlbumItem(item));
     await app.deleteFile({ fileList: [item.fileId] });
     await collections.albumItems.doc(item.id).remove();
     return sendJson(response, { ok: true });
@@ -372,7 +452,12 @@ async function route(request, response) {
     const item = await get(collections.albumItems, albumRenameMatch[1]);
     if (!item) return sendJson(response, { error: "not_found", message: "没有找到这段回忆" }, 404);
     const body = await readJson(request);
-    const renamed = { ...item, fileName: albumNameWithOriginalExtension(requiredString(body.name, "名字"), item.fileName) };
+    if (!matchesRevision(item, body.revision)) return conflict(response, publicAlbumItem(item));
+    const renamed = {
+      ...item,
+      fileName: albumNameWithOriginalExtension(requiredString(body.name, "名字"), item.fileName),
+      revision: nextRevision(item)
+    };
     await put(collections.albumItems, item.id, renamed);
     return sendJson(response, { item: publicAlbumItem(renamed) });
   }
@@ -389,6 +474,8 @@ async function route(request, response) {
       userId: user.id,
       latitude: coarse(latitude),
       longitude: coarse(longitude),
+      province: String(body.province || "").slice(0, 40),
+      city: String(body.city || "").slice(0, 40),
       updatedAt: nowIso()
     });
     return sendJson(response, { ok: true });
@@ -398,7 +485,95 @@ async function route(request, response) {
     const mine = await get(collections.locations, user.id);
     const other = await get(collections.locations, otherUserId(user.id));
     if (!mine || !other) return sendJson(response, { available: false });
-    return sendJson(response, { available: true, kilometers: roundedKm(distanceKm(mine, other)) });
+    return sendJson(response, {
+      available: true,
+      kilometers: roundedKm(distanceKm(mine, other)),
+      mine: publicLocation(mine),
+      other: publicLocation(other)
+    });
+  }
+
+  if (request.method === "GET" && pathName === "memories/documents") {
+    const documents = await query(collections.memoryDocuments, null, "updatedAt", "desc");
+    return sendJson(response, { documents: documents.map(publicMemoryDocument) });
+  }
+
+  if (request.method === "POST" && pathName === "memories/documents") {
+    const body = await readJson(request);
+    const timestamp = nowIso();
+    const document = {
+      id: randomId(),
+      title: requiredString(body.title, "标题").slice(0, 60),
+      content: requiredString(body.content, "内容").slice(0, 5000),
+      createdBy: user.id,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      revision: 1
+    };
+    await put(collections.memoryDocuments, document.id, document);
+    return sendJson(response, { document: publicMemoryDocument(document) }, 201);
+  }
+
+  const documentMatch = pathName.match(/^memories\/documents\/([^/]+)$/);
+  if (documentMatch && request.method === "PUT") {
+    const current = await get(collections.memoryDocuments, documentMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found", message: "没有找到这篇回忆" }, 404);
+    const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicMemoryDocument(current));
+    const document = {
+      ...current,
+      title: requiredString(body.title, "标题").slice(0, 60),
+      content: requiredString(body.content, "内容").slice(0, 5000),
+      updatedAt: nowIso(),
+      revision: nextRevision(current)
+    };
+    await put(collections.memoryDocuments, document.id, document);
+    return sendJson(response, { document: publicMemoryDocument(document) });
+  }
+
+  if (documentMatch && request.method === "DELETE") {
+    const current = await get(collections.memoryDocuments, documentMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found", message: "没有找到这篇回忆" }, 404);
+    const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicMemoryDocument(current));
+    await collections.memoryDocuments.doc(current.id).remove();
+    return sendJson(response, { ok: true });
+  }
+
+  if (request.method === "GET" && pathName === "memories/ai") {
+    const memories = await query(collections.aiMemories, null, "updatedAt", "desc");
+    return sendJson(response, { memories: memories.map(publicAiMemory) });
+  }
+
+  const aiMemoryMatch = pathName.match(/^memories\/ai\/([^/]+)$/);
+  if (aiMemoryMatch && request.method === "PUT") {
+    const current = await get(collections.aiMemories, aiMemoryMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found", message: "没有找到这条记忆" }, 404);
+    const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicAiMemory(current));
+    const memory = {
+      ...current,
+      content: requiredString(body.content, "记忆内容").slice(0, 1000),
+      editedByUser: true,
+      updatedAt: nowIso(),
+      revision: nextRevision(current)
+    };
+    await put(collections.aiMemories, memory.id, memory);
+    return sendJson(response, { memory: publicAiMemory(memory) });
+  }
+
+  if (aiMemoryMatch && request.method === "DELETE") {
+    const current = await get(collections.aiMemories, aiMemoryMatch[1]);
+    if (!current) return sendJson(response, { error: "not_found", message: "没有找到这条记忆" }, 404);
+    const body = await readJson(request);
+    if (!matchesRevision(current, body.revision)) return conflict(response, publicAiMemory(current));
+    await collections.aiMemories.doc(current.id).remove();
+    return sendJson(response, { ok: true });
+  }
+
+  if (request.method === "POST" && pathName === "memories/ai/from-materials") {
+    const saved = await generateMemoriesFromMaterials();
+    return sendJson(response, { memories: saved.map(publicAiMemory), count: saved.length });
   }
 
   return sendJson(response, { error: "not_found" }, 404);
@@ -409,6 +584,21 @@ async function ensureSeedData() {
     const timestamp = nowIso();
     await put(collections.personas, DEFAULT_PERSONA_ID, { ...DEFAULT_PERSONA, createdAt: timestamp, updatedAt: timestamp });
   }
+  const personas = await query(collections.personas);
+  await Promise.all(personas.filter((persona) => String(persona.memory || "").trim()).map(async (persona) => {
+    const documentId = `legacy-persona-${persona.id}`;
+    if (await get(collections.memoryDocuments, documentId)) return;
+    const timestamp = nowIso();
+    await put(collections.memoryDocuments, documentId, {
+      id: documentId,
+      title: `${persona.name}的旧版记忆`,
+      content: String(persona.memory).slice(0, 5000),
+      createdBy: "hkf",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      revision: 1
+    });
+  }));
   await Promise.all(DEFAULT_FEATURES.map(async (feature) => {
     if (!(await get(collections.features, feature.id))) await put(collections.features, feature.id, feature);
   }));
@@ -447,7 +637,7 @@ async function createAssistantReply(sessionId, personaId) {
       },
       body: JSON.stringify({
         model: llmModel(),
-        messages: modelMessages(persona, history),
+        messages: await modelMessages(persona, history),
         temperature: 0.8
       }),
       signal: llmRequestSignal()
@@ -475,7 +665,7 @@ async function streamFromModel(session, send) {
     },
     body: JSON.stringify({
       model: llmModel(),
-      messages: modelMessages(persona, history),
+      messages: await modelMessages(persona, history),
       temperature: 0.8,
       stream: true
     }),
@@ -487,6 +677,22 @@ async function streamFromModel(session, send) {
   }
 
   let assistantText = "";
+  let openingText = "";
+  let replyStarted = false;
+  const appendChunk = (chunk) => {
+    if (replyStarted) {
+      assistantText += chunk;
+      send("chunk", { text: chunk });
+      return;
+    }
+    openingText += chunk;
+    openingText = cleanAssistantText(openingText);
+    if (!openingText || couldBecomeAssistantPrefix(openingText)) return;
+    replyStarted = true;
+    assistantText += openingText;
+    send("chunk", { text: openingText });
+    openingText = "";
+  };
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -505,24 +711,29 @@ async function streamFromModel(session, send) {
         const data = JSON.parse(payload);
         const chunk = data?.choices?.[0]?.delta?.content || "";
         if (chunk) {
-          assistantText += chunk;
-          send("chunk", { text: chunk });
+          appendChunk(chunk);
         }
       } catch {
         // Ignore malformed provider stream fragments.
       }
     }
   }
+  if (openingText) {
+    const remaining = cleanAssistantText(openingText);
+    assistantText += remaining;
+    if (remaining) send("chunk", { text: remaining });
+  }
   return assistantText;
 }
 
 async function saveAssistantMessage(session, text) {
+  const cleanText = cleanAssistantText(text);
   const message = {
     id: randomId(),
     sessionId: session.id,
     role: "assistant",
     senderId: "bot",
-    text: text.trim() || fallbackReply(),
+    text: cleanText || fallbackReply(),
     createdAt: nowIso()
   };
   await put(collections.messages, message.id, message);
@@ -542,7 +753,7 @@ async function streamAssistantReply(response, session, userMessage) {
   try {
     send("user", { message: userMessage });
     if (process.env.LLM_API_KEY) {
-      assistantText = await streamFromModel(session, send);
+      assistantText = cleanAssistantText(await streamFromModel(session, send));
     }
     if (!assistantText) {
       assistantText = fallbackReply();
@@ -569,6 +780,8 @@ async function streamAssistantReply(response, session, userMessage) {
   await put(collections.sessions, session.id, { ...session, title, updatedAt: assistantMessage.createdAt });
   send("done", { message: publicMessage(assistantMessage), title });
   response.end();
+  await releaseChatReplyLock(session.id);
+  void considerChatMemory(session.id).catch((error) => logLlmNetworkFailure("memory", error));
 }
 
 async function createSessionTitle(userText, assistantText) {
@@ -640,12 +853,15 @@ function logLlmNetworkFailure(operation, error) {
   });
 }
 
-function modelMessages(persona, history) {
+async function modelMessages(persona, history) {
+  const memories = await query(collections.aiMemories, null, "updatedAt", "desc");
   return [
-    { role: "system", content: assistantSystemPrompt(persona) },
+    { role: "system", content: assistantSystemPrompt(persona, memories.slice(0, 30)) },
     ...history.map((message) => ({
       role: message.role === "assistant" ? "assistant" : "user",
-      content: `${displayName(message.senderId)}：${message.text}`
+      content: message.role === "assistant"
+        ? cleanAssistantText(message.text)
+        : `${displayName(message.senderId)}：${message.text}`
     }))
   ];
 }
@@ -690,15 +906,16 @@ function publicSession(item) {
 }
 
 function publicMessage(item) {
-  return { id: item.id, sessionId: item.sessionId, role: item.role, senderId: item.senderId, text: item.text, createdAt: item.createdAt };
+  const text = item.role === "assistant" ? cleanAssistantText(item.text) : item.text;
+  return { id: item.id, sessionId: item.sessionId, role: item.role, senderId: item.senderId, text, createdAt: item.createdAt };
 }
 
 function publicNote(item) {
-  return { id: item.id, authorId: item.authorId, text: item.text, createdAt: item.createdAt, updatedAt: item.updatedAt, readAt: item.readAt || null };
+  return { id: item.id, authorId: item.authorId, text: item.text, createdAt: item.createdAt, updatedAt: item.updatedAt, readAt: item.readAt || null, revision: Number(item.revision || 1) };
 }
 
 function publicCalendarEvent(item) {
-  return { id: item.id, date: item.date, title: item.title, note: item.note, createdBy: item.createdBy, createdAt: item.createdAt, updatedAt: item.updatedAt };
+  return { id: item.id, date: item.date, title: item.title, note: item.note, createdBy: item.createdBy, createdAt: item.createdAt, updatedAt: item.updatedAt, revision: Number(item.revision || 1) };
 }
 
 function publicAlbumItem(item) {
@@ -710,20 +927,60 @@ function publicAlbumItem(item) {
     fileName: item.fileName,
     byteSize: item.byteSize,
     previewBase64: item.previewBase64 || "",
-    createdAt: item.createdAt
+    createdAt: item.createdAt,
+    revision: Number(item.revision || 1)
   };
 }
 
-function requireUser(request) {
+function publicMemoryDocument(item) {
+  return {
+    id: item.id,
+    title: item.title,
+    content: item.content,
+    createdBy: item.createdBy,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    revision: Number(item.revision || 1)
+  };
+}
+
+function publicAiMemory(item) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    content: item.content,
+    sourceType: item.sourceType || item.kind,
+    sourceIds: item.sourceIds || [],
+    generatedAt: item.generatedAt,
+    updatedAt: item.updatedAt,
+    editedByUser: Boolean(item.editedByUser),
+    revision: Number(item.revision || 1)
+  };
+}
+
+function publicLocation(item) {
+  return {
+    userId: item.userId,
+    name: publicUser(users().find((user) => user.id === item.userId)).name,
+    province: item.province || "",
+    city: item.city || "",
+    updatedAt: item.updatedAt
+  };
+}
+
+async function requireUser(request) {
   const auth = request.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  return users().find((candidate) => candidate.token === token);
+  if (!token) return null;
+  const sessions = await query(collections.authSessions, { token });
+  const session = sessions[0];
+  return session ? users().find((candidate) => candidate.id === session.userId) || null : null;
 }
 
 function users() {
   return [
-    { id: "hkf", name: "锋宝", token: process.env.APP_TOKEN_HKF || "hkf-local-token", code: process.env.LOGIN_CODE_HKF || "hkf" },
-    { id: "cl", name: "璐宝", token: process.env.APP_TOKEN_CL || "cl-local-token", code: process.env.LOGIN_CODE_CL || "cl" }
+    { id: "hkf", name: "锋宝", code: process.env.LOGIN_CODE_HKF || "hkf" },
+    { id: "cl", name: "璐宝", code: process.env.LOGIN_CODE_CL || "cl" }
   ];
 }
 
@@ -779,11 +1036,16 @@ function cleanTitle(text) {
   return String(text || "").replace(/[《》"'“”]/g, "").trim().slice(0, 18);
 }
 
-function assistantSystemPrompt(persona) {
+function assistantSystemPrompt(persona, memories = []) {
+  const savedMemories = memories.length
+    ? memories.map((memory) => `- ${memory.content}`).join("\n")
+    : "暂无";
   return [
     persona.description,
-    `长期记忆：${persona.memory || "暂无"}`,
-    "称呼规则：内部账号 hkf、cl、HKF、CL 只用于系统识别，回复时绝对不要输出这些账号或缩写。提到两位用户时，只称呼为“恺锋”和“小璐”。"
+    "你的名字是小暖。",
+    `长期记忆：\n${savedMemories}`,
+    "称呼规则：内部账号 hkf、cl、HKF、CL 只用于系统识别，回复时绝对不要输出这些账号或缩写。提到两位用户时，只称呼为“恺锋”和“小璐”。",
+    "回复正文不要以“小暖：”“机器人：”“助手：”或类似角色标签开头。"
   ].join("\n");
 }
 
@@ -832,7 +1094,7 @@ function otherUserId(userId) {
 }
 
 function displayName(senderId) {
-  if (senderId === "bot") return "机器人";
+  if (senderId === "bot") return "小暖";
   if (senderId === "hkf") return "恺锋";
   if (senderId === "cl") return "小璐";
   return senderId;
@@ -862,4 +1124,172 @@ function toRad(value) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function matchesRevision(item, revision) {
+  return Number(revision || 1) === Number(item.revision || 1);
+}
+
+function nextRevision(item) {
+  return Number(item.revision || 1) + 1;
+}
+
+function conflict(response, latest) {
+  return sendJson(response, { error: "conflict", message: "内容已被另一台设备修改，请查看最新内容后再保存", latest }, 409);
+}
+
+function cleanAssistantText(value) {
+  let text = String(value || "").trim();
+  const prefix = /^(?:机器人|助手|小暖|小陪伴)\s*[：:]\s*/;
+  while (prefix.test(text)) text = text.replace(prefix, "").trimStart();
+  return text;
+}
+
+function couldBecomeAssistantPrefix(value) {
+  const text = String(value || "");
+  return ["机器人：", "机器人:", "助手：", "助手:", "小暖：", "小暖:", "小陪伴：", "小陪伴:"]
+    .some((prefix) => prefix.startsWith(text));
+}
+
+async function existingChatRequest(requestId) {
+  const id = String(requestId || "").trim();
+  return id ? get(collections.chatRequests, id) : null;
+}
+
+async function recordChatRequest(requestId, sessionId, messageId) {
+  const id = String(requestId || "").trim();
+  if (!id) return;
+  await put(collections.chatRequests, id, { id, sessionId, messageId, createdAt: nowIso() });
+}
+
+async function acquireChatReplyLock(sessionId) {
+  return db.runTransaction(async (transaction) => {
+    const reference = transaction.collection("sessions").doc(sessionId);
+    const result = await reference.get();
+    const session = result.data?.[0];
+    if (!session) {
+      const error = new Error("没有找到这个聊天");
+      error.code = "session_not_found";
+      throw error;
+    }
+    const lockedAt = session.replyLockedAt ? Date.parse(session.replyLockedAt) : 0;
+    if (lockedAt && Date.now() - lockedAt < 120000) {
+      const error = new Error("小暖正在回复上一条消息，请稍等一下");
+      error.code = "reply_in_progress";
+      throw error;
+    }
+    const locked = { ...withoutDatabaseId(session), id: sessionId, replyLockedAt: nowIso() };
+    await reference.set(locked);
+    return locked;
+  });
+}
+
+async function releaseChatReplyLock(sessionId) {
+  const session = await get(collections.sessions, sessionId);
+  if (!session?.replyLockedAt) return;
+  await put(collections.sessions, sessionId, { ...session, replyLockedAt: null });
+}
+
+async function considerChatMemory(sessionId) {
+  if (!process.env.LLM_API_KEY) return [];
+  const messages = await messagesForSession(sessionId);
+  if (!messages.length) return [];
+  const context = messages.map((message) => `${displayName(message.senderId)}：${message.text}`).join("\n").slice(-MAX_MEMORY_SOURCE_CHARS);
+  const decision = await requestLlmText([
+    {
+      role: "system",
+      content: "你负责判断情侣聊天中是否出现值得长期记住的信息。只有明确要求记住、稳定事实、重要共同经历、承诺或持续计划才回答 YES；普通闲聊、短暂情绪、一次性问题回答 NO。只输出 YES 或 NO。"
+    },
+    { role: "user", content: context }
+  ], 0.1);
+  if (!/^YES\b/i.test(decision)) return [];
+  return persistGeneratedMemories("chat", "chat", [sessionId], context);
+}
+
+async function generateMemoriesFromMaterials() {
+  const [documents, events, notes] = await Promise.all([
+    query(collections.memoryDocuments, null, "updatedAt", "desc"),
+    query(collections.calendarEvents, null, "date", "desc"),
+    query(collections.notes, null, "createdAt", "desc")
+  ]);
+  if (!documents.length && !events.length && !notes.length) return [];
+  const source = [
+    "【回忆文档】",
+    ...documents.map((item) => `${item.title}：${item.content}`),
+    "【重要日子】",
+    ...events.map((item) => `${item.date} ${item.title} ${item.note || ""}`),
+    "【留言】",
+    ...notes.map((item) => `${displayName(item.authorId)}：${item.text}`)
+  ].join("\n").slice(0, MAX_MEMORY_SOURCE_CHARS);
+  if (!source.trim()) return [];
+  return persistGeneratedMemories(
+    "life-material",
+    "document,calendar,note",
+    [...documents.map((item) => item.id), ...events.map((item) => item.id), ...notes.map((item) => item.id)],
+    source
+  );
+}
+
+async function persistGeneratedMemories(kind, sourceType, sourceIds, sourceText) {
+  let contents = [];
+  if (process.env.LLM_API_KEY) {
+    const raw = await requestLlmText([
+      {
+        role: "system",
+        content: "从情侣的共同资料中提炼适合长期保存的原子记忆。不要保存短暂情绪、原话长引用、推测、账号或精确位置。只输出 JSON 字符串数组，每项是一条简短中文记忆，最多 6 条。"
+      },
+      { role: "user", content: sourceText }
+    ], 0.3);
+    contents = parseMemoryArray(raw);
+  }
+  if (!contents.length) {
+    const fallback = sourceText.replace(/\s+/g, " ").slice(0, 180);
+    if (fallback) contents = [`共同资料摘要：${fallback}`];
+  }
+  const current = await query(collections.aiMemories, { kind });
+  const generated = [];
+  for (const content of contents.slice(0, 6)) {
+    const duplicate = current.find((item) => item.content === content);
+    if (duplicate) continue;
+    const timestamp = nowIso();
+    const memory = {
+      id: randomId(),
+      kind,
+      content: String(content).slice(0, 1000),
+      sourceType,
+      sourceIds: sourceIds.slice(0, 100),
+      generatedAt: timestamp,
+      updatedAt: timestamp,
+      editedByUser: false,
+      revision: 1
+    };
+    await put(collections.aiMemories, memory.id, memory);
+    generated.push(memory);
+  }
+  return generated;
+}
+
+async function requestLlmText(messages, temperature) {
+  const response = await fetch(`${llmBaseUrl()}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.LLM_API_KEY}` },
+    body: JSON.stringify({ model: llmModel(), messages, temperature }),
+    signal: llmRequestSignal()
+  });
+  if (!response.ok) {
+    await logLlmHttpFailure("memory", response);
+    return "";
+  }
+  const result = await response.json();
+  return String(result?.choices?.[0]?.message?.content || "").trim();
+}
+
+function parseMemoryArray(raw) {
+  try {
+    const jsonText = String(raw || "").replace(/^```(?:json)?\s*|\s*```$/g, "");
+    const parsed = JSON.parse(jsonText);
+    return Array.isArray(parsed) ? parsed.map((value) => String(value).trim()).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
 }

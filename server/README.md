@@ -4,9 +4,9 @@
 
 ## 使用的云服务
 
-- 云数据库：`features`、`personas`、`sessions`、`messages`、`notes`、`calendar_events`、`album_items`、`locations` 集合。
+- 云数据库：`features`、`personas`、`sessions`、`messages`、`notes`、`calendar_events`、`album_items`、`locations`、`auth_sessions`、`memory_documents`、`ai_memories`、`chat_requests` 集合。
 - 云存储：相册文件存入 `album/` 路径；数据库只保存元数据和预览内容。
-- DeepSeek API：默认模型 `deepseek-v4-flash`，用于聊天回复和新会话标题。
+- DeepSeek API：默认模型 `deepseek-v4-flash`，用于小暖回复、标题与长期记忆提炼。
 
 数据不会从旧 Cloudflare D1 自动迁移。新环境首次访问时会自动初始化默认功能和默认聊天风格。
 
@@ -15,8 +15,6 @@
 线上请在 HTTP 云函数配置中设置：
 
 ```text
-APP_TOKEN_HKF=替换为随机长字符串
-APP_TOKEN_CL=替换为另一个随机长字符串
 LOGIN_CODE_HKF=锋宝登录口令
 LOGIN_CODE_CL=璐宝登录口令
 LLM_API_KEY=你的DeepSeek API Key
@@ -24,6 +22,8 @@ LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-v4-flash
 LLM_TIMEOUT_MS=60000
 ```
+
+v8 由后端在登录时签发设备会话 token，同一身份的新登录会替换旧设备，不再需要配置固定 `APP_TOKEN_*`。
 
 本地运行时复制 `.env.example` 为 `.env`，另需填入 `TCB_ENV_ID`，并按 CloudBase 官方方式配置服务端访问凭据。
 

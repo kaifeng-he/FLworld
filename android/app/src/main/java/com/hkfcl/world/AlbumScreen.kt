@@ -67,11 +67,13 @@ internal fun AlbumScreen(
     onBackfillPreview: suspend (String, String) -> Unit,
     onLoadItem: suspend (String) -> AlbumItem,
     onError: (String) -> Unit,
-    onSaveImage: (AlbumItem) -> Unit
+    onSaveImage: suspend (AlbumItem) -> Unit,
+    onNotify: (String) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val states = remember { mutableStateMapOf<String, AlbumPreviewLoadState>() }
+    val downloadStates = remember { mutableStateMapOf<String, AlbumDownloadState>() }
     val loadingSlots = remember { Semaphore(3) }
     var preview by remember { mutableStateOf<AlbumPreviewLoadState.Ready?>(null) }
 
@@ -137,12 +139,22 @@ internal fun AlbumScreen(
                     },
                     onRename = onRename,
                     onDownload = {
-                        scope.launch {
-                            runCatching { onLoadItem(item.id) }
-                                .onSuccess { onSaveImage(it) }
-                                .onFailure { onError(it.message ?: "下载失败") }
+                        if (downloadStates[item.id] != AlbumDownloadState.Loading) {
+                            downloadStates[item.id] = AlbumDownloadState.Loading
+                            scope.launch {
+                                try {
+                                    val original = onLoadItem(item.id)
+                                    onSaveImage(original)
+                                    downloadStates[item.id] = AlbumDownloadState.Saved
+                                    onNotify("已保存到手机相册")
+                                } catch (error: Throwable) {
+                                    downloadStates[item.id] = AlbumDownloadState.Failed
+                                    onError(error.message ?: "下载失败")
+                                }
+                            }
                         }
                     },
+                    downloadState = downloadStates[item.id],
                     onDelete = onDelete,
                     onRetry = { preload(item, retry = true) }
                 )
@@ -182,6 +194,7 @@ private fun AlbumRow(
     onPreview: () -> Unit,
     onRename: (AlbumItem, String) -> Unit,
     onDownload: () -> Unit,
+    downloadState: AlbumDownloadState?,
     onDelete: (AlbumItem) -> Unit,
     onRetry: () -> Unit
 ) {
@@ -226,7 +239,18 @@ private fun AlbumRow(
                 TextButton(onClick = { name = fileBaseName(item.fileName); editing = false }) { Text("取消") }
             } else {
                 TextButton(onClick = { editing = true }) { Text("改名") }
-                if (item.mediaType == "image") TextButton(onClick = onDownload) { Text("下载") }
+                if (item.mediaType == "image") {
+                    TextButton(onClick = onDownload, enabled = downloadState != AlbumDownloadState.Loading) {
+                        Text(
+                            when (downloadState) {
+                                AlbumDownloadState.Loading -> "下载中..."
+                                AlbumDownloadState.Saved -> "已保存"
+                                AlbumDownloadState.Failed -> "重试"
+                                else -> "下载"
+                            }
+                        )
+                    }
+                }
                 TextButton(onClick = { onDelete(item) }) { Text("删除") }
             }
         }
@@ -237,6 +261,12 @@ private sealed interface AlbumPreviewLoadState {
     data object Loading : AlbumPreviewLoadState
     data object Failed : AlbumPreviewLoadState
     data class Ready(val item: AlbumItem, val bitmap: Bitmap) : AlbumPreviewLoadState
+}
+
+private enum class AlbumDownloadState {
+    Loading,
+    Saved,
+    Failed
 }
 
 private fun Context.albumDisplayName(uri: Uri): String {

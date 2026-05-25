@@ -76,13 +76,16 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -136,9 +139,12 @@ fun WorldApp() {
     var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
     var distance by remember { mutableStateOf<DistanceState?>(null) }
     var notes by remember { mutableStateOf(emptyList<Note>()) }
+    var unreadNotes by remember { mutableStateOf(0) }
     var calendarEvents by remember { mutableStateOf(emptyList<CalendarEvent>()) }
     var albumItems by remember { mutableStateOf(emptyList<AlbumItem>()) }
     var albumQuota by remember { mutableStateOf<AlbumQuotaState?>(null) }
+    var memoryDocuments by remember { mutableStateOf(emptyList<MemoryDocument>()) }
+    var aiMemories by remember { mutableStateOf(emptyList<AiMemory>()) }
     var loginStatus by remember { mutableStateOf("") }
     var errorLogs by remember { mutableStateOf(emptyList<String>()) }
     var backgroundClarity by remember { mutableStateOf(prefs.getFloat(BACKGROUND_CLARITY_KEY, DEFAULT_BACKGROUND_CLARITY)) }
@@ -146,7 +152,24 @@ fun WorldApp() {
         mutableStateOf(prefs.getFloat(READING_OVERLAY_STRENGTH_KEY, DEFAULT_READING_OVERLAY_STRENGTH))
     }
     val snackbarHostState = remember { SnackbarHostState() }
-    val api = remember(token) { ApiClient(token) }
+    val deviceId = remember {
+        prefs.getString("deviceId", null) ?: UUID.randomUUID().toString().also {
+            prefs.edit().putString("deviceId", it).apply()
+        }
+    }
+
+    fun clearLogin(message: String? = null) {
+        prefs.edit().remove("token").apply()
+        token = null
+        selectedSession = null
+        messages = emptyList()
+        message?.let {
+            errorLogs = listOf("${timeText(nowIsoText())}  $it") + errorLogs
+            scope.launch { snackbarHostState.showSnackbar(it) }
+        }
+    }
+
+    val api = remember(token) { ApiClient(token) { scope.launch { clearLogin("该身份已在另一台设备登录，请重新进入小世界") } } }
 
     fun report(message: String) {
         errorLogs = listOf("${timeText(nowIsoText())}  $message") + errorLogs
@@ -163,8 +186,12 @@ fun WorldApp() {
                 personas = api.personas()
                 sessions = api.sessions()
                 distance = api.distance()
-                notes = api.notes()
+                val noteState = api.notes()
+                notes = noteState.notes
+                unreadNotes = noteState.unreadCount
                 calendarEvents = sortedCalendarEvents(api.calendarEvents())
+                memoryDocuments = api.memoryDocuments()
+                aiMemories = api.aiMemories()
                 val album = api.album()
                 albumItems = album.first
                 albumQuota = album.second
@@ -191,7 +218,7 @@ fun WorldApp() {
                 return@launch
             }
             runCatching {
-                api.updateLocation(location.first, location.second)
+                api.updateLocation(location.latitude, location.longitude, location.province, location.city)
                 distance = api.distance()
             }.onFailure { report(it.message ?: "距离更新失败") }
         }
@@ -208,6 +235,13 @@ fun WorldApp() {
         }
     }
 
+    LaunchedEffect(token) {
+        while (token != null) {
+            delay(15_000)
+            refreshAll()
+        }
+    }
+
     if (token == null) {
         LoginScreen(
             backgroundClarity = backgroundClarity,
@@ -219,7 +253,7 @@ fun WorldApp() {
             onCode = { code = it },
             onLogin = {
                 scope.launch {
-                    runCatching { api.login(userId, code.ifBlank { userId }) }
+                    runCatching { api.login(userId, code.ifBlank { userId }, deviceId) }
                         .onSuccess { result ->
                             token = result.first
                             userId = result.second.id
@@ -378,12 +412,16 @@ fun WorldApp() {
                     when (page) {
                     null -> WorldHomeScreen(
                         distance = distance,
-                        notes = notes,
+                        unreadNotes = unreadNotes,
                         calendarEvents = calendarEvents,
                         albumQuota = albumQuota,
                         onOpen = { activeWorldPage = it },
                         onRefreshDistance = {
-                            if (locationHelper.hasPermission()) syncLocation() else locationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                            scope.launch {
+                                runCatching { api.distance() }
+                                    .onSuccess { distance = it }
+                                    .onFailure { report(it.message ?: "距离刷新失败") }
+                            }
                         }
                     )
                     WorldPage.Notes -> NotesScreen(
@@ -394,14 +432,20 @@ fun WorldApp() {
                             scope.launch {
                                 runCatching { api.createNote(text) }
                                     .onSuccess {
-                            notes = (notes + it).sortedBy { item -> item.createdAt }
+                                        notes = (notes + it).sortedBy { item -> item.createdAt }
                                     }
                                     .onFailure { report(it.message ?: "留言失败") }
                             }
                         },
                         onMarkRead = { note ->
                             if (note.authorId != userId && note.readAt == null) {
-                                scope.launch { runCatching { api.markNoteRead(note.id) } }
+                                scope.launch {
+                                    runCatching { api.markNoteRead(note.id) }
+                                        .onSuccess {
+                                            notes = notes.map { if (it.id == note.id) it.copy(readAt = nowIsoText()) else it }
+                                            unreadNotes = (unreadNotes - 1).coerceAtLeast(0)
+                                        }
+                                }
                             }
                         }
                     )
@@ -417,9 +461,9 @@ fun WorldApp() {
                                     .onFailure { report(it.message ?: "保存日历失败") }
                             }
                         },
-                        onUpdate = { id, date, title, note ->
+                        onUpdate = { event, date, title, note ->
                             scope.launch {
-                                runCatching { api.updateCalendarEvent(id, date, title, note) }
+                                runCatching { api.updateCalendarEvent(event.id, date, title, note, event.revision) }
                                     .onSuccess { updated ->
                                         calendarEvents = sortedCalendarEvents(calendarEvents.map { if (it.id == updated.id) updated else it })
                                     }
@@ -428,7 +472,7 @@ fun WorldApp() {
                         },
                         onDelete = { event ->
                             scope.launch {
-                                runCatching { api.deleteCalendarEvent(event.id) }
+                                runCatching { api.deleteCalendarEvent(event) }
                                     .onSuccess {
                                         calendarEvents = calendarEvents.filterNot { it.id == event.id }
                                     }
@@ -449,14 +493,14 @@ fun WorldApp() {
                         },
                         onDelete = { item ->
                             scope.launch {
-                                runCatching { api.deleteAlbumItem(item.id) }
+                                runCatching { api.deleteAlbumItem(item) }
                                     .onSuccess { refreshAlbum() }
                                     .onFailure { report(it.message ?: "删除失败") }
                             }
                         },
                         onRename = { item, name ->
                             scope.launch {
-                                runCatching { api.renameAlbumItem(item.id, name) }
+                                runCatching { api.renameAlbumItem(item.id, name, item.revision) }
                                     .onSuccess { renamed ->
                                         albumItems = albumItems.map { if (it.id == renamed.id) renamed else it }
                                     }
@@ -468,10 +512,53 @@ fun WorldApp() {
                         onLoadItem = { id -> api.albumItem(id) },
                         onError = { report(it) },
                         onSaveImage = { item ->
+                            saveImageToGallery(context, item)
+                        },
+                        onNotify = { notify(it) }
+                    )
+                    WorldPage.Memory -> MemoryScreen(
+                        documents = memoryDocuments,
+                        memories = aiMemories,
+                        onBack = { activeWorldPage = null },
+                        onSaveDocument = { existing, title, content ->
                             scope.launch {
-                                runCatching { saveImageToGallery(context, item) }
-                                    .onSuccess { notify("已保存到手机相册") }
-                                    .onFailure { report(it.message ?: "保存失败") }
+                                runCatching {
+                                    if (existing == null) api.createMemoryDocument(title, content)
+                                    else api.updateMemoryDocument(existing, title, content)
+                                }.onSuccess { refreshAll() }
+                                    .onFailure { report(it.message ?: "保存回忆失败"); refreshAll() }
+                            }
+                        },
+                        onDeleteDocument = { document ->
+                            scope.launch {
+                                runCatching { api.deleteMemoryDocument(document) }
+                                    .onSuccess { refreshAll() }
+                                    .onFailure { report(it.message ?: "删除回忆失败") }
+                            }
+                        },
+                        onSaveAiMemory = { memory, content ->
+                            scope.launch {
+                                runCatching { api.updateAiMemory(memory, content) }
+                                    .onSuccess { refreshAll() }
+                                    .onFailure { report(it.message ?: "修改小暖记忆失败"); refreshAll() }
+                            }
+                        },
+                        onDeleteAiMemory = { memory ->
+                            scope.launch {
+                                runCatching { api.deleteAiMemory(memory) }
+                                    .onSuccess { refreshAll() }
+                                    .onFailure { report(it.message ?: "删除小暖记忆失败") }
+                            }
+                        },
+                        onGenerate = { done ->
+                            scope.launch {
+                                runCatching { api.generateMaterialMemories() }
+                                    .onSuccess { count ->
+                                        refreshAll()
+                                        notify(if (count > 0) "小暖新记住了 $count 件事" else "小暖暂时没有发现新的长期回忆")
+                                    }
+                                    .onFailure { report(it.message ?: "整理故事失败") }
+                                done()
                             }
                         }
                     )
@@ -697,7 +784,7 @@ private fun ChatScreen(
             items(messages) { message ->
                 val mine = message.senderId == currentUserId
                 val label = when {
-                    message.senderId == "bot" -> "小陪伴"
+                    message.senderId == "bot" -> "小暖"
                     mine -> "我"
                     else -> displayName(message.senderId)
                 }
@@ -746,47 +833,56 @@ private fun MessageBubble(label: String, text: String, time: String, alignEnd: B
 @Composable
 private fun WorldHomeScreen(
     distance: DistanceState?,
-    notes: List<Note>,
+    unreadNotes: Int,
     calendarEvents: List<CalendarEvent>,
     albumQuota: AlbumQuotaState?,
     onOpen: (WorldPage) -> Unit,
     onRefreshDistance: () -> Unit
 ) {
     var showAllDays by remember { mutableStateOf(false) }
+    var showDistance by remember { mutableStateOf(false) }
     val displayEvents = sortedCalendarEvents(calendarEvents)
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             HighlightSectionCard {
                 Text("两个人的小世界", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(distanceText(distance), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
+                Text(
+                    distanceText(distance),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF7C3348),
+                    modifier = Modifier.clickable { showDistance = true }
+                )
+                Text("点击查看我们的大致位置", color = Color(0xFF85697E), style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = onRefreshDistance) { Text("更新距离") }
             }
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                FeatureCard("我想对你说", "把此刻的话留下来", "♡", Modifier.weight(1f)) { onOpen(WorldPage.Notes) }
-                FeatureCard("日历", "记住重要的日子", "○", Modifier.weight(1f)) { onOpen(WorldPage.Calendar) }
+                FeatureCard("我想对你说", "把此刻的话留下来", "💌", Modifier.weight(1f), unreadNotes) { onOpen(WorldPage.Notes) }
+                FeatureCard("日历", "记住重要的日子", "📅", Modifier.weight(1f)) { onOpen(WorldPage.Calendar) }
             }
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                FeatureCard("相册", albumQuotaText(albumQuota), "□", Modifier.weight(1f)) { onOpen(WorldPage.Album) }
-                FeatureCard("距离", distanceText(distance), "◇", Modifier.weight(1f), onRefreshDistance)
-            }
-        }
-        item {
-            SectionCard {
-                Text("最近留下的话", fontWeight = FontWeight.SemiBold)
-                Text(notes.firstOrNull()?.text ?: "还没有留言，可以先写一句想对对方说的话。", color = Color(0xFF6F5F66))
+                FeatureCard("相册", albumQuotaText(albumQuota), "🖼️", Modifier.weight(1f)) { onOpen(WorldPage.Album) }
+                FeatureCard("回忆", "和小暖一起珍藏故事", "📖", Modifier.weight(1f)) { onOpen(WorldPage.Memory) }
             }
         }
         item {
             SectionCard(Modifier.clickable { showAllDays = true }) {
                 Text("近期日子", fontWeight = FontWeight.SemiBold)
-                val preview = displayEvents.take(3).joinToString("\n") {
-                    listOfNotNull("${it.date} · ${it.title}", calendarDistanceText(it.date)).joinToString("  ")
+                if (displayEvents.isEmpty()) {
+                    Text("还没有记录重要日子。", color = Color(0xFF6F5F66))
+                } else {
+                    displayEvents.take(2).forEach { event ->
+                        CompactCalendarCard(event)
+                        Spacer(Modifier.height(6.dp))
+                    }
+                    if (displayEvents.size > 2) {
+                        Text("还有更多日子...", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+                    }
                 }
-                Text(preview.ifBlank { "还没有记录重要日子。" }, color = Color(0xFF6F5F66))
                 Text("点击查看所有日子", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
             }
         }
@@ -794,6 +890,53 @@ private fun WorldHomeScreen(
     if (showAllDays) {
         CalendarEventsDialog(events = displayEvents, onDismiss = { showAllDays = false })
     }
+    if (showDistance) {
+        DistanceDialog(distance = distance, onDismiss = { showDistance = false })
+    }
+}
+
+@Composable
+private fun CompactCalendarCard(event: CalendarEvent) {
+    Card(
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3F8)),
+        modifier = Modifier.fillMaxWidth().padding(top = 7.dp)
+    ) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            Text("${event.date} · ${event.title}", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                listOfNotNull(calendarDistanceText(event.date), event.note.takeIf { it.isNotBlank() }).joinToString(" · "),
+                color = Color(0xFF766A70),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun DistanceDialog(distance: DistanceState?, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("我们的大致位置", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(distanceText(distance), color = Color(0xFF7C3348), fontWeight = FontWeight.SemiBold)
+                listOf(distance?.mine, distance?.other).forEach { location ->
+                    if (location != null) {
+                        SectionCard {
+                            Text(location.name, fontWeight = FontWeight.SemiBold)
+                            Text(locationText(location), color = Color(0xFF6F5F66))
+                            Text("更新于 ${timeText(location.updatedAt)}", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                if (distance?.available != true) Text("等待两个人都打开 App 更新位置。", color = Color(0xFF6F5F66))
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+    )
 }
 
 @Composable
@@ -843,7 +986,7 @@ private fun CalendarScreen(
     events: List<CalendarEvent>,
     onBack: () -> Unit,
     onCreate: (String, String, String) -> Unit,
-    onUpdate: (String, String, String, String) -> Unit,
+    onUpdate: (CalendarEvent, String, String, String) -> Unit,
     onDelete: (CalendarEvent) -> Unit
 ) {
     var editing by remember { mutableStateOf<CalendarEvent?>(null) }
@@ -864,7 +1007,7 @@ private fun CalendarScreen(
                         val current = editing
                         if (date.isNotBlank() && title.isNotBlank()) {
                             if (current == null) onCreate(date.trim(), title.trim(), note.trim())
-                            else onUpdate(current.id, date.trim(), title.trim(), note.trim())
+                            else onUpdate(current, date.trim(), title.trim(), note.trim())
                             editing = null
                             date = todayText()
                             title = ""
@@ -933,6 +1076,127 @@ private fun CalendarEventsDialog(events: List<CalendarEvent>, onDismiss: () -> U
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
     )
+}
+
+@Composable
+private fun MemoryScreen(
+    documents: List<MemoryDocument>,
+    memories: List<AiMemory>,
+    onBack: () -> Unit,
+    onSaveDocument: (MemoryDocument?, String, String) -> Unit,
+    onDeleteDocument: (MemoryDocument) -> Unit,
+    onSaveAiMemory: (AiMemory, String) -> Unit,
+    onDeleteAiMemory: (AiMemory) -> Unit,
+    onGenerate: (() -> Unit) -> Unit
+) {
+    var editingDocument by remember { mutableStateOf<MemoryDocument?>(null) }
+    var title by remember { mutableStateOf("") }
+    var content by remember { mutableStateOf("") }
+    var generating by remember { mutableStateOf(false) }
+
+    fun edit(document: MemoryDocument?) {
+        editingDocument = document
+        title = document?.title.orEmpty()
+        content = document?.content.orEmpty()
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        PageTitle("回忆", onBack, "我们写下的故事，也让小暖慢慢记住")
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            item {
+                SectionCard {
+                    Text(if (editingDocument == null) "写一篇回忆" else "编辑回忆", fontWeight = FontWeight.SemiBold)
+                    OutlinedTextField(title, { title = it }, label = { Text("标题") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(content, { content = it }, label = { Text("写下我们的故事") }, minLines = 3, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = {
+                                if (title.isNotBlank() && content.isNotBlank()) {
+                                    onSaveDocument(editingDocument, title.trim(), content.trim())
+                                    edit(null)
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("保存") }
+                        if (editingDocument != null) {
+                            OutlinedButton(onClick = { edit(null) }) { Text("取消") }
+                        }
+                    }
+                }
+            }
+            item { Text("我们写下的回忆", fontWeight = FontWeight.SemiBold, color = Color(0xFF6B2944)) }
+            if (documents.isEmpty()) {
+                item { SectionCard { Text("还没有手写回忆，先写下第一篇吧。", color = Color(0xFF6F5F66)) } }
+            }
+            items(documents, key = { it.id }) { document ->
+                SectionCard {
+                    Text(document.title, fontWeight = FontWeight.SemiBold)
+                    Text(document.content, color = Color(0xFF6F5F66), maxLines = 4, overflow = TextOverflow.Ellipsis)
+                    Text("由 ${displayName(document.createdBy)} 更新", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+                    Row {
+                        TextButton(onClick = { edit(document) }) { Text("编辑") }
+                        TextButton(onClick = { onDeleteDocument(document) }) { Text("删除") }
+                    }
+                }
+            }
+            item {
+                SectionCard {
+                    Text("小暖记住的事", fontWeight = FontWeight.SemiBold)
+                    Text("小暖只保存适合长期陪伴的内容，你们可以随时修改或删除。", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            generating = true
+                            onGenerate { generating = false }
+                        },
+                        enabled = !generating,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (generating) "小暖正在翻阅..." else "让小暖翻翻我们的故事") }
+                }
+            }
+            item { Text("聊天中记住的", fontWeight = FontWeight.SemiBold, color = Color(0xFF6B2944)) }
+            val chatMemories = memories.filter { it.kind == "chat" }
+            if (chatMemories.isEmpty()) item { Text("还没有从聊天中留下的长期记忆。", color = Color(0xFF6F5F66)) }
+            items(chatMemories, key = { it.id }) { memory ->
+                AiMemoryCard(memory, onSaveAiMemory, onDeleteAiMemory)
+            }
+            item { Text("故事里读到的", fontWeight = FontWeight.SemiBold, color = Color(0xFF6B2944)) }
+            val materialMemories = memories.filter { it.kind == "life-material" }
+            if (materialMemories.isEmpty()) item { Text("点击按钮后，小暖会阅读文档、日历和留言。", color = Color(0xFF6F5F66)) }
+            items(materialMemories, key = { it.id }) { memory ->
+                AiMemoryCard(memory, onSaveAiMemory, onDeleteAiMemory)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AiMemoryCard(memory: AiMemory, onSave: (AiMemory, String) -> Unit, onDelete: (AiMemory) -> Unit) {
+    var editing by remember(memory.id) { mutableStateOf(false) }
+    var text by remember(memory.content) { mutableStateOf(memory.content) }
+    SectionCard {
+        if (editing) {
+            OutlinedTextField(text, { text = it }, label = { Text("小暖记住的内容") }, modifier = Modifier.fillMaxWidth())
+        } else {
+            Text(memory.content, color = Color(0xFF55404D))
+            Text(memorySourceText(memory.sourceType), color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+        }
+        Row {
+            if (editing) {
+                TextButton(onClick = {
+                    if (text.isNotBlank()) {
+                        onSave(memory, text.trim())
+                        editing = false
+                    }
+                }) { Text("保存") }
+                TextButton(onClick = { text = memory.content; editing = false }) { Text("取消") }
+            } else {
+                TextButton(onClick = { editing = true }) { Text("编辑") }
+                TextButton(onClick = { onDelete(memory) }) { Text("删除") }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1055,13 +1319,12 @@ private fun PersonaForm(
 ) {
     var name by remember(persona?.id) { mutableStateOf(persona?.name.orEmpty()) }
     var desc by remember(persona?.id) { mutableStateOf(persona?.description.orEmpty()) }
-    var memory by remember(persona?.id) { mutableStateOf(persona?.memory.orEmpty()) }
     var bubbleColor by remember(persona?.id) { mutableStateOf(persona?.bubbleColor ?: "#FFE0A8") }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
         Text(if (persona == null) "新建聊天风格" else "编辑聊天风格", fontWeight = FontWeight.SemiBold)
         OutlinedTextField(name, { name = it }, label = { Text("名称") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(desc, { desc = it }, label = { Text("说话风格") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(memory, { memory = it }, label = { Text("需要记住的事") }, modifier = Modifier.fillMaxWidth())
+        Text("长期记忆请在小世界的“回忆”中共同管理。", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
         Text("机器人消息颜色", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             personaColorOptions().forEach { color ->
@@ -1081,7 +1344,7 @@ private fun PersonaForm(
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             Button(
-                onClick = { onSave(persona, name.trim(), desc.trim(), memory.trim(), bubbleColor) },
+                onClick = { onSave(persona, name.trim(), desc.trim(), persona?.memory.orEmpty(), bubbleColor) },
                 enabled = name.isNotBlank() && desc.isNotBlank(),
                 modifier = Modifier.weight(1f)
             ) { Text("保存") }
@@ -1119,7 +1382,7 @@ private fun PersonaPicker(personas: List<Persona>, selected: String, onChange: (
 }
 
 @Composable
-private fun FeatureCard(title: String, subtitle: String, mark: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun FeatureCard(title: String, subtitle: String, mark: String, modifier: Modifier = Modifier, badgeCount: Int = 0, onClick: () -> Unit) {
     Card(
         modifier = modifier
             .height(118.dp)
@@ -1130,7 +1393,17 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
-            Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(mark, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                if (badgeCount > 0) {
+                    Box(
+                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0xFFE74458)).padding(horizontal = 7.dp, vertical = 2.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(if (badgeCount > 99) "99+" else badgeCount.toString(), color = Color.White, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
             Column {
                 Text(title, fontWeight = FontWeight.SemiBold)
                 Text(subtitle, color = Color(0xFF7B626A), style = MaterialTheme.typography.bodySmall)
@@ -1250,7 +1523,8 @@ private fun softBrush(): Brush = Brush.verticalGradient(
 private enum class WorldPage {
     Notes,
     Calendar,
-    Album
+    Album,
+    Memory
 }
 
 private const val DEFAULT_PERSONA_ID = "emotional-support"
@@ -1272,7 +1546,7 @@ private fun tabIcon(tab: Tab): String = when (tab) {
 internal fun displayName(userId: String): String = when (userId) {
     "hkf" -> "锋宝"
     "cl" -> "璐宝"
-    "bot" -> "小陪伴"
+    "bot" -> "小暖"
     else -> userId
 }
 
@@ -1337,6 +1611,14 @@ private fun nowIsoText(): String =
 
 private fun distanceText(distance: DistanceState?): String =
     if (distance?.available == true && distance.kilometers != null) "相隔约 ${distance.kilometers} 公里" else "等两个人都打开后显示距离"
+
+private fun locationText(location: LocationSummary): String =
+    listOf(location.province, location.city).filter { it.isNotBlank() }.distinct().joinToString(" / ").ifBlank { "等待更新位置" }
+
+private fun memorySourceText(sourceType: String): String = when {
+    sourceType.contains("calendar") || sourceType.contains("note") || sourceType.contains("document") -> "来自回忆文档、日历或留言"
+    else -> "来自聊天"
+}
 
 internal fun albumQuotaText(quota: AlbumQuotaState?): String =
     quota?.let { "已用 ${sizeText(it.usedBytes)} / ${sizeText(it.limitBytes)}" } ?: "相册空间 200兆"
