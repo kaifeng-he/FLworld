@@ -210,6 +210,15 @@ class ApiClient(
         return item.toAlbumItem()
     }
 
+    suspend fun albumPreview(id: String): AlbumItem {
+        val item = request("GET", "/album/$id/preview").getJSONObject("item")
+        return item.toAlbumItem()
+    }
+
+    suspend fun saveAlbumPreview(id: String, previewBase64: String) {
+        request("PUT", "/album/$id/preview", JSONObject().put("previewBase64", previewBase64))
+    }
+
     suspend fun renameAlbumItem(id: String, name: String): AlbumItem {
         val item = request("PUT", "/album/$id/name", JSONObject().put("name", name)).getJSONObject("item")
         return item.toAlbumItem()

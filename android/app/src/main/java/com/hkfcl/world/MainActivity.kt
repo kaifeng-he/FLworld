@@ -3,13 +3,9 @@ package com.hkfcl.world
 import android.Manifest
 import android.content.ContentValues
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.net.Uri
 import android.os.Build
-import android.os.Bundle
-import android.provider.OpenableColumns
 import android.provider.MediaStore
+import android.os.Bundle
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -67,7 +63,6 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -76,7 +71,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -96,12 +90,12 @@ class MainActivity : ComponentActivity() {
 fun WorldTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = lightColorScheme(
-            primary = Color(0xFFC84B6A),
-            secondary = Color(0xFF8B6FAD),
-            tertiary = Color(0xFF3F8F86),
-            background = Color(0xFFFFF7F8),
-            surface = Color(0xFFFFFFFF),
-            surfaceVariant = Color(0xFFFFE8EE)
+            primary = Color(0xFFE14F82),
+            secondary = Color(0xFF7253B5),
+            tertiary = Color(0xFFE8A049),
+            background = Color(0xFFFAF3FC),
+            surface = Color(0xFFFFFAFE),
+            surfaceVariant = Color(0xFFF6E6F4)
         ),
         content = content
     )
@@ -225,7 +219,7 @@ fun WorldApp() {
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = Color.White.copy(alpha = 0.92f)) {
+            NavigationBar(containerColor = Color(0xFFF9EAF4).copy(alpha = 0.92f)) {
                 Tab.entries.forEach { item ->
                     NavigationBarItem(
                         selected = tab == item,
@@ -356,7 +350,6 @@ fun WorldApp() {
                         calendarEvents = calendarEvents,
                         albumQuota = albumQuota,
                         onOpen = { activeWorldPage = it },
-                        onOpenCalendar = { activeWorldPage = WorldPage.Calendar },
                         onRefreshDistance = {
                             if (locationHelper.hasPermission()) syncLocation() else locationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
                         }
@@ -438,13 +431,10 @@ fun WorldApp() {
                                     .onFailure { report(it.message ?: "改名失败") }
                             }
                         },
-                        onLoadItem = { id, onLoaded ->
-                            scope.launch {
-                                runCatching { api.albumItem(id) }
-                                    .onSuccess { onLoaded(it) }
-                                    .onFailure { report(it.message ?: "加载失败") }
-                            }
-                        },
+                        onLoadPreview = { id -> api.albumPreview(id) },
+                        onBackfillPreview = { id, base64 -> api.saveAlbumPreview(id, base64) },
+                        onLoadItem = { id -> api.albumItem(id) },
+                        onError = { report(it) },
                         onSaveImage = { item ->
                             scope.launch {
                                 runCatching { saveImageToGallery(context, item) }
@@ -701,9 +691,9 @@ private fun WorldHomeScreen(
     calendarEvents: List<CalendarEvent>,
     albumQuota: AlbumQuotaState?,
     onOpen: (WorldPage) -> Unit,
-    onOpenCalendar: () -> Unit,
     onRefreshDistance: () -> Unit
 ) {
+    var showAllDays by remember { mutableStateOf(false) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             SectionCard(Modifier.background(softBrush())) {
@@ -731,13 +721,16 @@ private fun WorldHomeScreen(
             }
         }
         item {
-            SectionCard(Modifier.clickable { onOpenCalendar() }) {
+            SectionCard(Modifier.clickable { showAllDays = true }, containerColor = Color(0xFFFDF3FA).copy(alpha = 0.9f)) {
                 Text("近期日子", fontWeight = FontWeight.SemiBold)
                 val preview = calendarEvents.take(3).joinToString("\n") { "${it.date} · ${it.title}" }
                 Text(preview.ifBlank { "还没有记录重要日子。" }, color = Color(0xFF6F5F66))
                 Text("点击查看所有日子", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
             }
         }
+    }
+    if (showAllDays) {
+        CalendarEventsDialog(events = calendarEvents, onDismiss = { showAllDays = false })
     }
 }
 
@@ -751,7 +744,7 @@ private fun NotesScreen(
 ) {
     var text by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize()) {
-        PageTitle("我想对你说", onBack)
+        PageTitle("我想对你说", onBack, "给对方留下一句只属于你们的话")
         SectionCard {
             OutlinedTextField(text, { text = it }, label = { Text("写下想说的话") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
             Spacer(Modifier.height(8.dp))
@@ -796,7 +789,7 @@ private fun CalendarScreen(
     var title by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize()) {
-        PageTitle("日历", onBack)
+        PageTitle("日历", onBack, "把值得记住的日子写下来")
         SectionCard {
             Text(if (editing == null) "记下一个日子" else "修改这个日子", fontWeight = FontWeight.SemiBold)
             OutlinedTextField(date, { date = it }, label = { Text("日期，例如 2026-05-25") }, modifier = Modifier.fillMaxWidth())
@@ -851,151 +844,27 @@ private fun CalendarScreen(
 }
 
 @Composable
-private fun AlbumScreen(
-    items: List<AlbumItem>,
-    quota: AlbumQuotaState?,
-    onBack: () -> Unit,
-    onUpload: (String, String, ByteArray, String, String?) -> Unit,
-    onDelete: (AlbumItem) -> Unit,
-    onRename: (AlbumItem, String) -> Unit,
-    onLoadItem: (String, (AlbumItem) -> Unit) -> Unit,
-    onSaveImage: (AlbumItem) -> Unit
-) {
-    val context = LocalContext.current
-    var preview by remember { mutableStateOf<AlbumItem?>(null) }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri != null) {
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@rememberLauncherForActivityResult
-            val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
-            val name = context.displayName(uri)
-            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-            val previewBase64 = if (mimeType.startsWith("image/")) imagePreviewBase64(bytes) else null
-            onUpload(name, mimeType, bytes, base64, previewBase64)
-        }
-    }
-
-    Column(Modifier.fillMaxSize()) {
-        PageTitle("相册", onBack)
-        SectionCard {
-            Text("把照片和视频放在这里", fontWeight = FontWeight.SemiBold)
-            Text(albumQuotaText(quota), color = Color(0xFF6F5F66))
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = { picker.launch(arrayOf("image/*", "video/*")) }, modifier = Modifier.fillMaxWidth()) { Text("添加照片或视频") }
-        }
-        preview?.let { item ->
-            Spacer(Modifier.height(10.dp))
-            AlbumPreview(item)
-        }
-        Spacer(Modifier.height(10.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(items) { item ->
-                AlbumRow(
-                    item = item,
-                    onPreview = {
-                        if (item.previewBase64?.isNotBlank() == true) {
-                            preview = item
-                        } else {
-                            onLoadItem(item.id) { preview = it }
+private fun CalendarEventsDialog(events: List<CalendarEvent>, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("所有日子", fontWeight = FontWeight.Bold) },
+        text = {
+            if (events.isEmpty()) {
+                Text("还没有记录重要日子。", color = Color(0xFF6F5F66))
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(events.sortedBy { it.date }) { event ->
+                        SectionCard(containerColor = Color(0xFFFFF7FB)) {
+                            Text("${event.date} · ${event.title}", fontWeight = FontWeight.SemiBold)
+                            if (event.note.isNotBlank()) Text(event.note, color = Color(0xFF6F5F66))
+                            Text("由 ${displayName(event.createdBy)} 记录", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
                         }
-                    },
-                    onRename = onRename,
-                    onDownload = {
-                        onLoadItem(item.id) { fullItem ->
-                            preview = fullItem
-                            onSaveImage(fullItem)
-                        }
-                    },
-                    onDelete = onDelete
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun AlbumPreview(item: AlbumItem) {
-    SectionCard {
-        Text(item.fileName, fontWeight = FontWeight.SemiBold)
-        val imageData = item.previewBase64?.takeIf { it.isNotBlank() } ?: item.dataBase64
-        val bytes = imageData?.let { Base64.decode(it, Base64.DEFAULT) }
-        if (item.mediaType == "image" && bytes != null) {
-            val bitmap = remember(item.id, imageData) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
-            bitmap?.let {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = "相册照片",
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(220.dp)
-                        .clip(RoundedCornerShape(12.dp)),
-                    contentScale = ContentScale.Crop
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            Text("这里显示快速预览，下载时会保存原图。", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
-        } else {
-            Text("这是一段视频，已经保存在相册里。", color = Color(0xFF6F5F66))
-        }
-    }
-}
-
-@Composable
-private fun AlbumRow(
-    item: AlbumItem,
-    onPreview: () -> Unit,
-    onRename: (AlbumItem, String) -> Unit,
-    onDownload: () -> Unit,
-    onDelete: (AlbumItem) -> Unit
-) {
-    var editing by remember(item.id) { mutableStateOf(false) }
-    var name by remember(item.fileName) { mutableStateOf(fileBaseName(item.fileName)) }
-    SectionCard(Modifier.clickable { onPreview() }) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier
-                    .size(46.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Color(0xFFFFE8EE)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(if (item.mediaType == "video") "视频" else "照片")
-            }
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                if (editing) {
-                    OutlinedTextField(
-                        value = name,
-                        onValueChange = { name = it },
-                        label = { Text("名字") },
-                        suffix = { Text(fileExtension(item.fileName)) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                } else {
-                    Text(item.fileName, fontWeight = FontWeight.SemiBold)
-                    Text("${displayName(item.uploaderId)} · ${sizeText(item.byteSize)}", color = Color(0xFF6F5F66))
+                    }
                 }
             }
-        }
-        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-            if (editing) {
-                TextButton(onClick = {
-                    val value = name.trim()
-                    if (value.isNotEmpty()) {
-                        onRename(item, value)
-                        editing = false
-                    }
-                }) { Text("保存") }
-                TextButton(onClick = {
-                    name = fileBaseName(item.fileName)
-                    editing = false
-                }) { Text("取消") }
-            } else {
-                TextButton(onClick = { editing = true }) { Text("改名") }
-                if (item.mediaType == "image") TextButton(onClick = onDownload) { Text("下载") }
-                TextButton(onClick = { onDelete(item) }) { Text("删除") }
-            }
-        }
-    }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+    )
 }
 
 @Composable
@@ -1158,12 +1027,12 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
         modifier = modifier
             .height(118.dp)
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.9f)),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5FB).copy(alpha = 0.9f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 5.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
-            Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
             Column {
                 Text(title, fontWeight = FontWeight.SemiBold)
                 Text(subtitle, color = Color(0xFF7B626A), style = MaterialTheme.typography.bodySmall)
@@ -1173,16 +1042,16 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
 }
 
 @Composable
-private fun SectionCard(
+internal fun SectionCard(
     modifier: Modifier = Modifier,
-    containerColor: Color = Color.White.copy(alpha = 0.9f),
+    containerColor: Color = Color(0xFFFFFBFE).copy(alpha = 0.88f),
     content: @Composable ColumnScope.() -> Unit
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = containerColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Column(Modifier.padding(14.dp), content = content)
     }
@@ -1196,8 +1065,8 @@ private fun AppBackground(content: @Composable () -> Unit) {
             contentDescription = null,
             modifier = Modifier
                 .fillMaxSize()
-                .blur(28.dp)
-                .alpha(0.18f),
+                .blur(22.dp)
+                .alpha(0.44f),
             contentScale = ContentScale.Crop
         )
         Box(
@@ -1206,9 +1075,9 @@ private fun AppBackground(content: @Composable () -> Unit) {
                 .background(
                     Brush.verticalGradient(
                         listOf(
-                            Color(0xFFFFF7FA).copy(alpha = 0.88f),
-                            Color(0xFFFFFBF7).copy(alpha = 0.9f),
-                            Color(0xFFF2F7FF).copy(alpha = 0.88f)
+                            Color(0xFF311C65).copy(alpha = 0.23f),
+                            Color(0xFFFFEFF8).copy(alpha = 0.7f),
+                            Color(0xFFFFDCEB).copy(alpha = 0.76f)
                         )
                     )
                 )
@@ -1218,12 +1087,26 @@ private fun AppBackground(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun PageTitle(title: String, onBack: () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        TextButton(onClick = onBack) { Text("返回") }
-        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+internal fun PageTitle(title: String, onBack: () -> Unit, subtitle: String? = null) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Card(
+            modifier = Modifier
+                .size(44.dp)
+                .clickable(onClick = onBack),
+            shape = RoundedCornerShape(15.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8FC).copy(alpha = 0.94f))
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("‹", color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF49295D))
+            subtitle?.let { Text(it, color = Color(0xFF85697E), style = MaterialTheme.typography.bodySmall) }
+        }
     }
-    Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(14.dp))
 }
 
 @Composable
@@ -1239,7 +1122,7 @@ private fun ConfirmDialog(title: String, text: String, onDismiss: () -> Unit, on
 
 @Composable
 private fun softBrush(): Brush = Brush.verticalGradient(
-    listOf(Color(0xFFFFF1F4), Color(0xFFFFFBF8), Color(0xFFF7F2FF))
+    listOf(Color(0xFFFFE4F1), Color(0xFFFFF4F8), Color(0xFFECE6FF))
 )
 
 private enum class WorldPage {
@@ -1256,7 +1139,7 @@ private fun tabIcon(tab: Tab): String = when (tab) {
     Tab.Mine -> "我"
 }
 
-private fun displayName(userId: String): String = when (userId) {
+internal fun displayName(userId: String): String = when (userId) {
     "hkf" -> "锋宝"
     "cl" -> "璐宝"
     "bot" -> "小陪伴"
@@ -1313,10 +1196,10 @@ private fun nowIsoText(): String =
 private fun distanceText(distance: DistanceState?): String =
     if (distance?.available == true && distance.kilometers != null) "相隔约 ${distance.kilometers} 公里" else "等两个人都打开后显示距离"
 
-private fun albumQuotaText(quota: AlbumQuotaState?): String =
+internal fun albumQuotaText(quota: AlbumQuotaState?): String =
     quota?.let { "已用 ${sizeText(it.usedBytes)} / ${sizeText(it.limitBytes)}" } ?: "相册空间 200兆"
 
-private fun sizeText(bytes: Long): String {
+internal fun sizeText(bytes: Long): String {
     val mb = bytes / 1024.0 / 1024.0
     return if (mb < 10) String.format("%.1f兆", mb) else "${mb.toInt()}兆"
 }
@@ -1327,43 +1210,6 @@ private fun todayText(): String {
     val month = calendar.get(java.util.Calendar.MONTH) + 1
     val day = calendar.get(java.util.Calendar.DAY_OF_MONTH)
     return "%04d-%02d-%02d".format(year, month, day)
-}
-
-private fun Context.displayName(uri: Uri): String {
-    contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        if (index >= 0 && cursor.moveToFirst()) return cursor.getString(index)
-    }
-    return "珍贵回忆"
-}
-
-private fun fileBaseName(fileName: String): String =
-    fileName.substringBeforeLast('.', fileName)
-
-private fun fileExtension(fileName: String): String {
-    val index = fileName.lastIndexOf('.')
-    return if (index > 0 && index < fileName.lastIndex) fileName.substring(index) else ""
-}
-
-private fun imagePreviewBase64(bytes: ByteArray): String? {
-    val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
-    val maxSide = maxOf(source.width, source.height).coerceAtLeast(1)
-    val scale = 360f / maxSide
-    val preview = if (scale < 1f) {
-        Bitmap.createScaledBitmap(
-            source,
-            (source.width * scale).toInt().coerceAtLeast(1),
-            (source.height * scale).toInt().coerceAtLeast(1),
-            true
-        )
-    } else {
-        source
-    }
-    val output = ByteArrayOutputStream()
-    preview.compress(Bitmap.CompressFormat.JPEG, 45, output)
-    if (preview !== source) preview.recycle()
-    source.recycle()
-    return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
 }
 
 private fun saveImageToGallery(context: Context, item: AlbumItem) {

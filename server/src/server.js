@@ -302,11 +302,8 @@ async function route(request, env) {
   }
 
   if (request.method === "GET" && pathName === "album") {
-    const hasPreview = await albumItemsHasPreviewData(env.DB);
     const { results } = await env.DB.prepare(
-      hasPreview
-        ? "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, preview_base64 AS previewBase64, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
-        : "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
+      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, created_at AS createdAt FROM album_items ORDER BY created_at DESC LIMIT 100"
     ).all();
     const usedBytes = await albumUsedBytes(env.DB);
     return json({ items: results, quota: { usedBytes, limitBytes: ALBUM_QUOTA_BYTES } });
@@ -374,6 +371,32 @@ async function route(request, env) {
     return json({ item });
   }
 
+  const albumPreviewMatch = pathName.match(/^album\/([^/]+)\/preview$/);
+  if (albumPreviewMatch && request.method === "GET") {
+    const item = await env.DB.prepare(
+      "SELECT id, uploader_id AS uploaderId, media_type AS mediaType, mime_type AS mimeType, file_name AS fileName, byte_size AS byteSize, preview_base64 AS previewBase64, created_at AS createdAt FROM album_items WHERE id = ?"
+    ).bind(albumPreviewMatch[1]).first();
+    if (!item) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
+    return json({ item });
+  }
+
+  if (albumPreviewMatch && request.method === "PUT") {
+    const current = await env.DB.prepare(
+      "SELECT id, media_type AS mediaType FROM album_items WHERE id = ?"
+    ).bind(albumPreviewMatch[1]).first();
+    if (!current) return json({ error: "not_found", message: "没有找到这段回忆" }, 404);
+    if (current.mediaType !== "image") return json({ error: "invalid_media", message: "视频不能写入照片预览" }, 400);
+    const body = await readJson(request);
+    const previewBase64 = requiredString(body.previewBase64, "预览图");
+    if (previewBase64.length > 512 * 1024) {
+      return json({ error: "preview_too_large", message: "预览图过大" }, 413);
+    }
+    await env.DB.prepare("UPDATE album_items SET preview_base64 = ? WHERE id = ?")
+      .bind(previewBase64, current.id)
+      .run();
+    return json({ ok: true });
+  }
+
   if (albumMatch && request.method === "DELETE") {
     await env.DB.prepare("DELETE FROM album_chunks WHERE item_id = ?").bind(albumMatch[1]).run();
     const result = await env.DB.prepare("DELETE FROM album_items WHERE id = ?").bind(albumMatch[1]).run();
@@ -437,6 +460,9 @@ async function ensureSchema(db) {
     db.prepare("CREATE INDEX IF NOT EXISTS idx_calendar_events_date ON calendar_events(date)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_album_items_created_at ON album_items(created_at)")
   ]);
+  if (!(await albumItemsHasPreviewData(db))) {
+    await db.prepare("ALTER TABLE album_items ADD COLUMN preview_base64 TEXT NOT NULL DEFAULT ''").run();
+  }
 }
 
 async function ensureSeedData(db) {
