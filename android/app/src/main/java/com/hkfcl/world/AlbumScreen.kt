@@ -116,7 +116,7 @@ internal fun AlbumScreen(
 
     Column(Modifier.fillMaxSize()) {
         PageTitle("相册", onBack, "提前准备好每一张想看的回忆")
-        SectionCard(containerColor = Color(0xFFFFF5FB).copy(alpha = 0.93f)) {
+        SectionCard {
             Text("我们的相册", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(albumQuotaText(quota), color = Color(0xFF6F5F66))
             Spacer(Modifier.height(8.dp))
@@ -188,7 +188,7 @@ private fun AlbumRow(
     var editing by remember(item.id) { mutableStateOf(false) }
     var name by remember(item.fileName) { mutableStateOf(fileBaseName(item.fileName)) }
     val canPreview = item.mediaType == "image" && previewState is AlbumPreviewLoadState.Ready
-    SectionCard(Modifier.clickable(enabled = canPreview) { onPreview() }, containerColor = Color(0xFFFFFAFE).copy(alpha = 0.92f)) {
+    SectionCard(Modifier.clickable(enabled = canPreview) { onPreview() }) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(58.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xFFF4E4F4)), contentAlignment = Alignment.Center) {
                 when {

@@ -11,6 +11,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -31,6 +34,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.AlertDialog
@@ -44,6 +48,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -72,6 +77,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
 import java.util.Locale
 import java.util.TimeZone
 
@@ -125,6 +132,7 @@ fun WorldApp() {
     var albumQuota by remember { mutableStateOf<AlbumQuotaState?>(null) }
     var loginStatus by remember { mutableStateOf("") }
     var errorLogs by remember { mutableStateOf(emptyList<String>()) }
+    var backgroundClarity by remember { mutableStateOf(prefs.getFloat(BACKGROUND_CLARITY_KEY, DEFAULT_BACKGROUND_CLARITY)) }
     val snackbarHostState = remember { SnackbarHostState() }
     val api = remember(token) { ApiClient(token) }
 
@@ -144,7 +152,7 @@ fun WorldApp() {
                 sessions = api.sessions()
                 distance = api.distance()
                 notes = api.notes()
-                calendarEvents = api.calendarEvents()
+                calendarEvents = sortedCalendarEvents(api.calendarEvents())
                 val album = api.album()
                 albumItems = album.first
                 albumQuota = album.second
@@ -190,6 +198,7 @@ fun WorldApp() {
 
     if (token == null) {
         LoginScreen(
+            backgroundClarity = backgroundClarity,
             selectedUserId = userId,
             code = code,
             status = loginStatus,
@@ -234,14 +243,15 @@ fun WorldApp() {
             }
         }
     ) { padding ->
-        AppBackground {
+        AppBackground(backgroundClarity) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
                     .padding(16.dp)
             ) {
-                when (tab) {
+                Crossfade(targetState = tab, animationSpec = tween(230), label = "main-tab-transition") { selectedTab ->
+                when (selectedTab) {
                     Tab.Chat -> ChatScreen(
                     currentUserId = userId,
                     personas = personas,
@@ -343,7 +353,8 @@ fun WorldApp() {
                     }
                 )
 
-                    Tab.World -> when (activeWorldPage) {
+                    Tab.World -> Crossfade(targetState = activeWorldPage, animationSpec = tween(230), label = "world-page-transition") { page ->
+                    when (page) {
                     null -> WorldHomeScreen(
                         distance = distance,
                         notes = notes,
@@ -380,7 +391,7 @@ fun WorldApp() {
                             scope.launch {
                                 runCatching { api.createCalendarEvent(date, title, note) }
                                     .onSuccess {
-                                        calendarEvents = (calendarEvents + it).sortedBy { item -> item.date }
+                                        calendarEvents = sortedCalendarEvents(calendarEvents + it)
                                     }
                                     .onFailure { report(it.message ?: "保存日历失败") }
                             }
@@ -389,7 +400,7 @@ fun WorldApp() {
                             scope.launch {
                                 runCatching { api.updateCalendarEvent(id, date, title, note) }
                                     .onSuccess { updated ->
-                                        calendarEvents = calendarEvents.map { if (it.id == updated.id) updated else it }.sortedBy { it.date }
+                                        calendarEvents = sortedCalendarEvents(calendarEvents.map { if (it.id == updated.id) updated else it })
                                     }
                                     .onFailure { report(it.message ?: "更新日历失败") }
                             }
@@ -443,18 +454,29 @@ fun WorldApp() {
                             }
                         }
                     )
+                    }
                 }
 
                     Tab.Mine -> MineScreen(
                     userName = userName,
                     errorLogs = errorLogs,
+                    backgroundClarity = backgroundClarity,
+                    onBackgroundClarityChanged = { clarity ->
+                        backgroundClarity = clarity
+                        prefs.edit().putFloat(BACKGROUND_CLARITY_KEY, clarity).apply()
+                    },
                     onLogout = {
-                        prefs.edit().clear().apply()
+                        prefs.edit()
+                            .remove("token")
+                            .remove("userId")
+                            .remove("userName")
+                            .apply()
                         token = null
                         selectedSession = null
                         messages = emptyList()
                     }
                     )
+                }
                 }
             }
         }
@@ -463,6 +485,7 @@ fun WorldApp() {
 
 @Composable
 private fun LoginScreen(
+    backgroundClarity: Float,
     selectedUserId: String,
     code: String,
     status: String,
@@ -470,7 +493,7 @@ private fun LoginScreen(
     onCode: (String) -> Unit,
     onLogin: () -> Unit
 ) {
-    AppBackground {
+    AppBackground(backgroundClarity) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -529,18 +552,27 @@ private fun ChatScreen(
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
     var deletingPersona by remember { mutableStateOf<Persona?>(null) }
     var deletingSession by remember { mutableStateOf<ChatSession?>(null) }
+    var selectedPersonaId by remember { mutableStateOf(DEFAULT_PERSONA_ID) }
     val activePersona = selectedSession?.let { session -> personas.firstOrNull { it.id == session.personaId } }
+    val defaultPersonaName = personas.firstOrNull { it.id == DEFAULT_PERSONA_ID }?.name ?: "温柔情感陪伴"
+    val selectedPersonaName = personas.firstOrNull { it.id == selectedPersonaId }?.name ?: defaultPersonaName
+
+    LaunchedEffect(personas, selectedPersonaId) {
+        if (personas.none { it.id == selectedPersonaId }) selectedPersonaId = DEFAULT_PERSONA_ID
+    }
 
     if (selectedSession == null) {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
-                SectionCard(containerColor = Color.White.copy(alpha = 0.88f)) {
+                SectionCard {
                     Text("聊天", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF6B2944))
-                    Text("默认使用温柔情感陪伴。", color = Color(0xFF7B626A))
+                    Text("当前聊天风格：$selectedPersonaName", color = Color(0xFF66546F))
+                    Spacer(Modifier.height(10.dp))
+                    PersonaPicker(personas, selectedPersonaId) { selectedPersonaId = it }
                     Spacer(Modifier.height(14.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
-                            onClick = { onCreateSession(DEFAULT_PERSONA_ID) },
+                            onClick = { onCreateSession(selectedPersonaId) },
                             enabled = personas.isNotEmpty(),
                             modifier = Modifier.weight(1f)
                         ) { Text("新建对话") }
@@ -553,13 +585,13 @@ private fun ChatScreen(
             }
             if (sessions.isEmpty()) {
                 item {
-                    SectionCard(containerColor = Color.White.copy(alpha = 0.82f)) {
+                    SectionCard {
                         Text("还没有历史对话。", color = Color(0xFF6F5F66))
                     }
                 }
             }
             items(sessions) { session ->
-                SectionCard(Modifier.clickable { onSelectSession(session) }, containerColor = Color.White.copy(alpha = 0.9f)) {
+                SectionCard(Modifier.clickable { onSelectSession(session) }) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Text(session.title, fontWeight = FontWeight.SemiBold)
@@ -618,7 +650,7 @@ private fun ChatScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        SectionCard(containerColor = Color.White.copy(alpha = 0.88f)) {
+        SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 TextButton(onClick = onBackToSessions) { Text("返回") }
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -628,7 +660,7 @@ private fun ChatScreen(
                         fontWeight = FontWeight.Bold,
                         style = MaterialTheme.typography.titleMedium
                     )
-                    Text(activePersona?.name ?: "默认聊天风格", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
+                    Text("当前聊天风格：${activePersona?.name ?: defaultPersonaName}", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
                 }
                 TextButton(onClick = { onSelectSession(selectedSession) }) { Text("刷新") }
             }
@@ -694,9 +726,13 @@ private fun WorldHomeScreen(
     onRefreshDistance: () -> Unit
 ) {
     var showAllDays by remember { mutableStateOf(false) }
+    val displayEvents = sortedCalendarEvents(calendarEvents)
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            SectionCard(Modifier.background(softBrush())) {
+            SectionCard(
+                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(softBrush()),
+                containerColor = Color.Transparent
+            ) {
                 Text("两个人的小世界", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(distanceText(distance), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
                 TextButton(onClick = onRefreshDistance) { Text("更新距离") }
@@ -721,16 +757,18 @@ private fun WorldHomeScreen(
             }
         }
         item {
-            SectionCard(Modifier.clickable { showAllDays = true }, containerColor = Color(0xFFFDF3FA).copy(alpha = 0.9f)) {
+            SectionCard(Modifier.clickable { showAllDays = true }) {
                 Text("近期日子", fontWeight = FontWeight.SemiBold)
-                val preview = calendarEvents.take(3).joinToString("\n") { "${it.date} · ${it.title}" }
+                val preview = displayEvents.take(3).joinToString("\n") {
+                    listOfNotNull("${it.date} · ${it.title}", calendarDistanceText(it.date)).joinToString("  ")
+                }
                 Text(preview.ifBlank { "还没有记录重要日子。" }, color = Color(0xFF6F5F66))
                 Text("点击查看所有日子", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
             }
         }
     }
     if (showAllDays) {
-        CalendarEventsDialog(events = calendarEvents, onDismiss = { showAllDays = false })
+        CalendarEventsDialog(events = displayEvents, onDismiss = { showAllDays = false })
     }
 }
 
@@ -823,9 +861,12 @@ private fun CalendarScreen(
         }
         Spacer(Modifier.height(10.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(events) { event ->
+            items(sortedCalendarEvents(events)) { event ->
                 SectionCard {
                     Text("${event.date} · ${event.title}", fontWeight = FontWeight.SemiBold)
+                    calendarDistanceText(event.date)?.let {
+                        Text(it, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodySmall)
+                    }
                     if (event.note.isNotBlank()) Text(event.note, color = Color(0xFF6F5F66))
                     Text("由 ${displayName(event.createdBy)} 记录", color = Color(0xFF8A747B))
                     Row {
@@ -853,9 +894,12 @@ private fun CalendarEventsDialog(events: List<CalendarEvent>, onDismiss: () -> U
                 Text("还没有记录重要日子。", color = Color(0xFF6F5F66))
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(events.sortedBy { it.date }) { event ->
-                        SectionCard(containerColor = Color(0xFFFFF7FB)) {
+                    items(sortedCalendarEvents(events)) { event ->
+                        SectionCard {
                             Text("${event.date} · ${event.title}", fontWeight = FontWeight.SemiBold)
+                            calendarDistanceText(event.date)?.let {
+                                Text(it, color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodySmall)
+                            }
                             if (event.note.isNotBlank()) Text(event.note, color = Color(0xFF6F5F66))
                             Text("由 ${displayName(event.createdBy)} 记录", color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
                         }
@@ -871,6 +915,8 @@ private fun CalendarEventsDialog(events: List<CalendarEvent>, onDismiss: () -> U
 private fun MineScreen(
     userName: String,
     errorLogs: List<String>,
+    backgroundClarity: Float,
+    onBackgroundClarityChanged: (Float) -> Unit,
     onLogout: () -> Unit
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -880,6 +926,19 @@ private fun MineScreen(
                 Text("只属于两个人的陪伴、记录和日常。", color = Color(0xFF6F5F66))
                 Spacer(Modifier.height(8.dp))
                 Text("当前身份：$userName", color = Color(0xFF6F5F66))
+            }
+        }
+        item {
+            SectionCard {
+                Text("显示设置", fontWeight = FontWeight.SemiBold)
+                Text("背景清晰度：${(backgroundClarity * 100).toInt()}%", color = Color(0xFF6F5F66))
+                Slider(
+                    value = backgroundClarity,
+                    onValueChange = onBackgroundClarityChanged,
+                    valueRange = 0f..1f,
+                    steps = 4
+                )
+                Text("调高会看清更多背景细节，页面仍保留阅读遮罩。", color = Color(0xFF766A70), style = MaterialTheme.typography.bodySmall)
             }
         }
         item {
@@ -895,7 +954,12 @@ private fun MineScreen(
             }
         }
         item {
-            OutlinedButton(onClick = onLogout, modifier = Modifier.fillMaxWidth()) { Text("退出登录") }
+            OutlinedButton(
+                onClick = onLogout,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF513871)),
+                border = BorderStroke(1.dp, Color(0xFF513871).copy(alpha = 0.72f))
+            ) { Text("退出登录", fontWeight = FontWeight.SemiBold) }
         }
     }
 }
@@ -924,7 +988,7 @@ private fun PersonaManagerDialog(
                 }
                 items(personas) { persona ->
                     val isDefault = persona.id == DEFAULT_PERSONA_ID
-                    SectionCard(containerColor = Color(0xFFFFFBFD)) {
+                    SectionCard {
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                             Box(
                                 Modifier
@@ -1028,8 +1092,8 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
             .height(118.dp)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5FB).copy(alpha = 0.9f)),
-        elevation = CardDefaults.cardElevation(defaultElevation = 5.dp)
+        colors = CardDefaults.cardColors(containerColor = FEATURE_CARD_COLOR),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
             Text(mark, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
@@ -1044,26 +1108,28 @@ private fun FeatureCard(title: String, subtitle: String, mark: String, modifier:
 @Composable
 internal fun SectionCard(
     modifier: Modifier = Modifier,
-    containerColor: Color = Color(0xFFFFFBFE).copy(alpha = 0.88f),
+    containerColor: Color = GLASS_CARD_COLOR,
     content: @Composable ColumnScope.() -> Unit
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = containerColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(Modifier.padding(14.dp), content = content)
     }
 }
 
 @Composable
-private fun AppBackground(content: @Composable () -> Unit) {
+private fun AppBackground(clarity: Float, content: @Composable () -> Unit) {
+    val adjustedClarity = clarity.coerceIn(0f, 1f)
+    val blurRadius = (34f - adjustedClarity * 18f).dp
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Box(
             Modifier
                 .fillMaxSize()
-                .blur(26.dp)
+                .blur(blurRadius)
                 .background(Color.Black)
         ) {
             Image(
@@ -1071,7 +1137,7 @@ private fun AppBackground(content: @Composable () -> Unit) {
                 contentDescription = null,
                 modifier = Modifier
                     .fillMaxSize()
-                    .alpha(0.68f),
+                    .alpha(0.6f + adjustedClarity * 0.18f),
                 contentScale = ContentScale.Fit
             )
         }
@@ -1081,9 +1147,9 @@ private fun AppBackground(content: @Composable () -> Unit) {
                 .background(
                     Brush.verticalGradient(
                         listOf(
-                            Color(0xFF120D23).copy(alpha = 0.33f),
-                            Color(0xFFFAEAF4).copy(alpha = 0.57f),
-                            Color(0xFFFFDCEB).copy(alpha = 0.65f)
+                            Color(0xFF120D23).copy(alpha = 0.42f - adjustedClarity * 0.2f),
+                            Color(0xFFFAEAF4).copy(alpha = 0.66f - adjustedClarity * 0.2f),
+                            Color(0xFFFFDCEB).copy(alpha = 0.74f - adjustedClarity * 0.2f)
                         )
                     )
                 )
@@ -1100,7 +1166,7 @@ internal fun PageTitle(title: String, onBack: () -> Unit, subtitle: String? = nu
                 .size(44.dp)
                 .clickable(onClick = onBack),
             shape = RoundedCornerShape(15.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8FC).copy(alpha = 0.94f))
+            colors = CardDefaults.cardColors(containerColor = GLASS_CARD_COLOR)
         ) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("‹", color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -1128,7 +1194,11 @@ private fun ConfirmDialog(title: String, text: String, onDismiss: () -> Unit, on
 
 @Composable
 private fun softBrush(): Brush = Brush.verticalGradient(
-    listOf(Color(0xFFFFE4F1), Color(0xFFFFF4F8), Color(0xFFECE6FF))
+    listOf(
+        Color(0xFFFFE4F1).copy(alpha = 0.86f),
+        Color(0xFFFFF4F8).copy(alpha = 0.76f),
+        Color(0xFFECE6FF).copy(alpha = 0.8f)
+    )
 )
 
 private enum class WorldPage {
@@ -1138,6 +1208,10 @@ private enum class WorldPage {
 }
 
 private const val DEFAULT_PERSONA_ID = "emotional-support"
+private const val BACKGROUND_CLARITY_KEY = "backgroundClarity"
+private const val DEFAULT_BACKGROUND_CLARITY = 0.45f
+private val GLASS_CARD_COLOR = Color(0xFFFFFBFE).copy(alpha = 0.72f)
+private val FEATURE_CARD_COLOR = Color(0xFFFFF5FB).copy(alpha = 0.76f)
 
 private fun tabIcon(tab: Tab): String = when (tab) {
     Tab.Chat -> "聊"
@@ -1175,6 +1249,18 @@ private fun personaColorOptions(): List<String> = listOf(
     "#DFF5EC"
 )
 
+private fun sortedCalendarEvents(events: List<CalendarEvent>): List<CalendarEvent> =
+    events.sortedByDescending { it.date }
+
+private fun calendarDistanceText(date: String): String? {
+    val eventDate = runCatching { LocalDate.parse(date) }.getOrNull() ?: return null
+    return when (val days = ChronoUnit.DAYS.between(LocalDate.now(), eventDate)) {
+        0L -> "今天"
+        in 1L..Long.MAX_VALUE -> "还有 $days 天"
+        else -> "已经过去 ${-days} 天"
+    }
+}
+
 private fun dateText(value: String): String = formatIso(value, "yyyy-MM-dd")
 
 private fun timeText(value: String): String = formatIso(value, "yyyy-MM-dd HH:mm")
@@ -1210,13 +1296,7 @@ internal fun sizeText(bytes: Long): String {
     return if (mb < 10) String.format("%.1f兆", mb) else "${mb.toInt()}兆"
 }
 
-private fun todayText(): String {
-    val calendar = java.util.Calendar.getInstance()
-    val year = calendar.get(java.util.Calendar.YEAR)
-    val month = calendar.get(java.util.Calendar.MONTH) + 1
-    val day = calendar.get(java.util.Calendar.DAY_OF_MONTH)
-    return "%04d-%02d-%02d".format(year, month, day)
-}
+private fun todayText(): String = LocalDate.now().toString()
 
 private fun saveImageToGallery(context: Context, item: AlbumItem) {
     if (item.mediaType != "image") error("只能下载图片")
