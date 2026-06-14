@@ -277,8 +277,8 @@ class ApiClient(
         request("DELETE", "/memories/ai/${memory.id}", JSONObject().put("revision", memory.revision))
     }
 
-    suspend fun generateMaterialMemories(): Int {
-        return request("POST", "/memories/ai/from-materials").optInt("count")
+    suspend fun refreshAiMemories(): Int {
+        return request("POST", "/memories/ai/refresh").optInt("count")
     }
 
     private suspend fun request(method: String, path: String, body: JSONObject? = null, authenticated: Boolean = true): JSONObject =
@@ -413,6 +413,8 @@ private fun JSONObject.toAiMemory(): AiMemory =
         kind = getString("kind"),
         content = getString("content"),
         sourceType = optString("sourceType"),
+        sourceIds = optJSONArray("sourceIds")?.mapStrings() ?: emptyList(),
+        sourceLabel = optString("sourceLabel"),
         generatedAt = optString("generatedAt"),
         updatedAt = optString("updatedAt"),
         editedByUser = optBoolean("editedByUser"),
@@ -424,3 +426,6 @@ private fun JSONObject.optNullableString(name: String): String? =
 
 private fun <T> JSONArray.mapObjects(block: (JSONObject) -> T): List<T> =
     (0 until length()).map { index -> block(getJSONObject(index)) }
+
+private fun JSONArray.mapStrings(): List<String> =
+    (0 until length()).mapNotNull { index -> optString(index).takeIf { it.isNotBlank() } }

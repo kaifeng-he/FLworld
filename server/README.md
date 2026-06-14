@@ -4,7 +4,7 @@
 
 ## 使用的云服务
 
-- 云数据库：`features`、`personas`、`sessions`、`messages`、`notes`、`calendar_events`、`album_items`、`locations`、`auth_sessions`、`memory_documents`、`ai_memories`、`chat_requests` 集合。
+- 云数据库：`features`、`personas`、`sessions`、`messages`、`notes`、`calendar_events`、`album_items`、`locations`、`auth_sessions`、`memory_documents`、`ai_memories`、`memory_source_states`、`chat_requests` 集合。
 - 云存储：相册文件存入 `album/` 路径；数据库只保存元数据和预览内容。
 - DeepSeek API：默认模型 `deepseek-v4-flash`，用于小暖回复、标题与长期记忆提炼。
 

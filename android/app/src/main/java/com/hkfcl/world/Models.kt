@@ -101,6 +101,8 @@ data class AiMemory(
     val kind: String,
     val content: String,
     val sourceType: String,
+    val sourceIds: List<String> = emptyList(),
+    val sourceLabel: String = "",
     val generatedAt: String,
     val updatedAt: String,
     val editedByUser: Boolean,

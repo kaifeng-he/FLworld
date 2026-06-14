@@ -552,7 +552,7 @@ fun WorldApp() {
                         },
                         onGenerate = { done ->
                             scope.launch {
-                                runCatching { api.generateMaterialMemories() }
+                                runCatching { api.refreshAiMemories() }
                                     .onSuccess { count ->
                                         refreshAll()
                                         notify(if (count > 0) "小暖新记住了 $count 件事" else "小暖暂时没有发现新的长期回忆")
@@ -1180,7 +1180,7 @@ private fun AiMemoryCard(memory: AiMemory, onSave: (AiMemory, String) -> Unit, o
             OutlinedTextField(text, { text = it }, label = { Text("小暖记住的内容") }, modifier = Modifier.fillMaxWidth())
         } else {
             Text(memory.content, color = Color(0xFF55404D))
-            Text(memorySourceText(memory.sourceType), color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
+            Text(memory.sourceLabel.ifBlank { memorySourceText(memory.sourceType) }, color = Color(0xFF8A747B), style = MaterialTheme.typography.bodySmall)
         }
         Row {
             if (editing) {
@@ -1616,7 +1616,11 @@ private fun locationText(location: LocationSummary): String =
     listOf(location.province, location.city).filter { it.isNotBlank() }.distinct().joinToString(" / ").ifBlank { "等待更新位置" }
 
 private fun memorySourceText(sourceType: String): String = when {
-    sourceType.contains("calendar") || sourceType.contains("note") || sourceType.contains("document") -> "来自回忆文档、日历或留言"
+    sourceType == "document" -> "来自回忆文档"
+    sourceType == "calendar" -> "来自日历"
+    sourceType == "note" -> "来自留言"
+    sourceType.contains("chat") -> "来自聊天"
+    sourceType.contains("document") || sourceType.contains("calendar") || sourceType.contains("note") || sourceType == "mixed" -> "来自多个来源"
     else -> "来自聊天"
 }
 

@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import tcb from "@cloudbase/node-sdk";
 
 const DEFAULT_PERSONA_ID = "emotional-support";
@@ -9,6 +10,7 @@ const DEFAULT_BOT_BUBBLE_COLOR = "#FFE0A8";
 const PORT = Number(process.env.PORT || 9000);
 const DEFAULT_LLM_TIMEOUT_MS = 60000;
 const MAX_MEMORY_SOURCE_CHARS = 40000;
+const MAX_MEMORY_PROMPT_ITEMS = 80;
 
 const DEFAULT_FEATURES = [
   { id: "distance", title: "距离", status: "ready", sortOrder: 0 },
@@ -43,6 +45,7 @@ const collections = {
   authSessions: db.collection("auth_sessions"),
   memoryDocuments: db.collection("memory_documents"),
   aiMemories: db.collection("ai_memories"),
+  memorySourceStates: db.collection("memory_source_states"),
   chatRequests: db.collection("chat_requests")
 };
 
@@ -551,9 +554,11 @@ async function route(request, response) {
     if (!current) return sendJson(response, { error: "not_found", message: "没有找到这条记忆" }, 404);
     const body = await readJson(request);
     if (!matchesRevision(current, body.revision)) return conflict(response, publicAiMemory(current));
+    const content = requiredString(body.content, "记忆内容").slice(0, 1000);
     const memory = {
       ...current,
-      content: requiredString(body.content, "记忆内容").slice(0, 1000),
+      content,
+      memoryKey: memoryKeyForContent(content),
       editedByUser: true,
       updatedAt: nowIso(),
       revision: nextRevision(current)
@@ -571,8 +576,8 @@ async function route(request, response) {
     return sendJson(response, { ok: true });
   }
 
-  if (request.method === "POST" && pathName === "memories/ai/from-materials") {
-    const saved = await generateMemoriesFromMaterials();
+  if (request.method === "POST" && (pathName === "memories/ai/refresh" || pathName === "memories/ai/from-materials")) {
+    const saved = await refreshMemories();
     return sendJson(response, { memories: saved.map(publicAiMemory), count: saved.length });
   }
 
@@ -950,12 +955,16 @@ function publicMemoryDocument(item) {
 }
 
 function publicAiMemory(item) {
+  const sourceRefs = normalizedSourceRefs(item.sourceRefs);
   return {
     id: item.id,
     kind: item.kind,
     content: item.content,
     sourceType: item.sourceType || item.kind,
-    sourceIds: item.sourceIds || [],
+    sourceIds: item.sourceIds || sourceRefs.map((ref) => ref.id),
+    sourceRefs,
+    sourceLabel: item.sourceLabel || memorySourceLabel(sourceRefs, item.sourceType || item.kind),
+    memoryKey: item.memoryKey || memoryKeyForContent(item.content || ""),
     generatedAt: item.generatedAt,
     updatedAt: item.updatedAt,
     editedByUser: Boolean(item.editedByUser),
@@ -1197,18 +1206,48 @@ async function releaseChatReplyLock(sessionId) {
 
 async function considerChatMemory(sessionId) {
   if (!process.env.LLM_API_KEY) return [];
+  const session = await get(collections.sessions, sessionId);
+  if (!session) return [];
+  const state = await getMemorySourceState("chat", sessionId);
   const messages = await messagesForSession(sessionId);
-  if (!messages.length) return [];
-  const context = messages.map((message) => `${displayName(message.senderId)}：${message.text}`).join("\n").slice(-MAX_MEMORY_SOURCE_CHARS);
+  const newMessages = state?.processedUntilAt
+    ? messages.filter((message) => String(message.createdAt || "") > state.processedUntilAt)
+    : messages;
+  if (!newMessages.length) return [];
+
+  const source = chatMemorySource(session, messages, newMessages);
   const decision = await requestLlmText([
     {
       role: "system",
       content: "你负责判断情侣聊天中是否出现值得长期记住的信息。只有明确要求记住、稳定事实、重要共同经历、承诺或持续计划才回答 YES；普通闲聊、短暂情绪、一次性问题回答 NO。只输出 YES 或 NO。"
     },
-    { role: "user", content: context }
+    { role: "user", content: source.text }
   ], 0.1);
-  if (!/^YES\b/i.test(decision)) return [];
-  return persistGeneratedMemories("chat", "chat", [sessionId], context);
+  if (!decision.trim()) return [];
+  if (!/^YES\b/i.test(decision)) {
+    await markMemorySourceProcessed(source, []);
+    return [];
+  }
+  const result = await generateMemoriesForSourceBatch("chat", [source]);
+  if (!result.ok) return [];
+  await markMemorySourceProcessed(source, result.generated.map((memory) => memory.id));
+  return result.generated;
+}
+
+async function refreshMemories() {
+  const materialMemories = await generateMemoriesFromMaterials();
+  const chatMemories = await refreshChatMemoriesFromSessions();
+  return [...materialMemories, ...chatMemories];
+}
+
+async function refreshChatMemoriesFromSessions() {
+  if (!process.env.LLM_API_KEY) return [];
+  const sessions = await query(collections.sessions, null, "updatedAt", "desc");
+  const generated = [];
+  for (const session of sessions) {
+    generated.push(...await considerChatMemory(session.id));
+  }
+  return generated;
 }
 
 async function generateMemoriesFromMaterials() {
@@ -1217,52 +1256,87 @@ async function generateMemoriesFromMaterials() {
     query(collections.calendarEvents, null, "date", "desc"),
     query(collections.notes, null, "createdAt", "desc")
   ]);
-  if (!documents.length && !events.length && !notes.length) return [];
-  const source = [
-    "【回忆文档】",
-    ...documents.map((item) => `${item.title}：${item.content}`),
-    "【重要日子】",
-    ...events.map((item) => `${item.date} ${item.title} ${item.note || ""}`),
-    "【留言】",
-    ...notes.map((item) => `${displayName(item.authorId)}：${item.text}`)
-  ].join("\n").slice(0, MAX_MEMORY_SOURCE_CHARS);
-  if (!source.trim()) return [];
-  return persistGeneratedMemories(
-    "life-material",
-    "document,calendar,note",
-    [...documents.map((item) => item.id), ...events.map((item) => item.id), ...notes.map((item) => item.id)],
-    source
-  );
+  const sources = materialMemorySources(documents, events, notes);
+  if (!sources.length) return [];
+  const states = await memorySourceStatesMap();
+  const pending = sources.filter((source) => states.get(source.stateId)?.fingerprint !== source.fingerprint);
+  if (!pending.length) return [];
+
+  const generated = [];
+  for (const batch of chunkMemorySources(pending)) {
+    const result = await generateMemoriesForSourceBatch("life-material", batch);
+    if (!result.ok) continue;
+    generated.push(...result.generated);
+    await Promise.all(batch.map((source) => {
+      const memoryIds = result.generated
+        .filter((memory) => normalizedSourceRefs(memory.sourceRefs).some((ref) => ref.type === source.type && ref.id === source.id))
+        .map((memory) => memory.id);
+      return markMemorySourceProcessed(source, memoryIds);
+    }));
+  }
+  return generated;
 }
 
-async function persistGeneratedMemories(kind, sourceType, sourceIds, sourceText) {
-  let contents = [];
-  if (process.env.LLM_API_KEY) {
+async function generateMemoriesForSourceBatch(kind, sources) {
+  const usableSources = sources.filter((source) => String(source.text || "").trim());
+  if (!usableSources.length) return { ok: true, generated: [] };
+
+  let items = [];
+  if (!process.env.LLM_API_KEY) {
+    items = fallbackMemoryItems(usableSources);
+  } else {
+    const current = await query(collections.aiMemories, null, "updatedAt", "desc");
     const raw = await requestLlmText([
       {
         role: "system",
-        content: "从情侣的共同资料中提炼适合长期保存的原子记忆。不要保存短暂情绪、原话长引用、推测、账号或精确位置。只输出 JSON 字符串数组，每项是一条简短中文记忆，最多 6 条。"
+        content: [
+          "从情侣的共同资料中提炼适合长期保存的原子记忆。",
+          "只保存稳定事实、重要共同经历、承诺、偏好或持续计划。",
+          "不要保存短暂情绪、原话长引用、推测、账号或精确位置。",
+          "不要输出已保存长期记忆已经覆盖的内容。",
+          "每条记忆必须引用输入中的来源，source id 必须完全来自输入。",
+          "只输出 JSON 数组，格式为 [{\"content\":\"简短中文记忆\",\"sources\":[{\"type\":\"document|calendar|note|chat\",\"id\":\"来源ID\"}]}]；没有新记忆时输出 []。"
+        ].join("")
       },
-      { role: "user", content: sourceText }
+      {
+        role: "user",
+        content: [
+          "【已保存长期记忆】",
+          current.slice(0, MAX_MEMORY_PROMPT_ITEMS).map((memory) => `- ${memory.content}`).join("\n") || "（暂无）",
+          "",
+          "【待分析来源】",
+          sourcePromptText(usableSources)
+        ].join("\n")
+      }
     ], 0.3);
-    contents = parseMemoryArray(raw);
+    if (!raw.trim()) return { ok: false, generated: [] };
+    items = parseMemoryItems(raw, usableSources);
+    if (!items) return { ok: false, generated: [] };
   }
-  if (!contents.length) {
-    const fallback = sourceText.replace(/\s+/g, " ").slice(0, 180);
-    if (fallback) contents = [`共同资料摘要：${fallback}`];
-  }
-  const current = await query(collections.aiMemories, { kind });
+
+  const generated = await persistGeneratedMemories(kind, items);
+  return { ok: true, generated };
+}
+
+async function persistGeneratedMemories(kind, items) {
+  const current = await query(collections.aiMemories, null, "updatedAt", "desc");
   const generated = [];
-  for (const content of contents.slice(0, 6)) {
-    const duplicate = current.find((item) => item.content === content);
-    if (duplicate) continue;
+  for (const item of items.slice(0, 6)) {
+    const content = String(item.content || "").trim().slice(0, 1000);
+    const sourceRefs = normalizedSourceRefs(item.sourceRefs);
+    const memoryKey = memoryKeyForContent(content);
+    if (!content || !memoryKey || hasDuplicateMemory(current, content, memoryKey)) continue;
     const timestamp = nowIso();
+    const sourceType = memorySourceType(sourceRefs, item.sourceType);
     const memory = {
-      id: randomId(),
+      id: `memory-${memoryKey.slice(0, 32)}`,
       kind,
-      content: String(content).slice(0, 1000),
+      content,
+      memoryKey,
       sourceType,
-      sourceIds: sourceIds.slice(0, 100),
+      sourceIds: unique(sourceRefs.map((ref) => ref.id)).slice(0, 100),
+      sourceRefs: sourceRefs.slice(0, 10),
+      sourceLabel: memorySourceLabel(sourceRefs, sourceType),
       generatedAt: timestamp,
       updatedAt: timestamp,
       editedByUser: false,
@@ -1270,6 +1344,7 @@ async function persistGeneratedMemories(kind, sourceType, sourceIds, sourceText)
     };
     await put(collections.aiMemories, memory.id, memory);
     generated.push(memory);
+    current.unshift(memory);
   }
   return generated;
 }
@@ -1289,12 +1364,270 @@ async function requestLlmText(messages, temperature) {
   return String(result?.choices?.[0]?.message?.content || "").trim();
 }
 
-function parseMemoryArray(raw) {
+function materialMemorySources(documents, events, notes) {
+  return [
+    ...documents.map((item) => ({
+      type: "document",
+      id: item.id,
+      label: `回忆文档：${compactLabel(item.title, "未命名回忆")}`,
+      text: [`标题：${item.title}`, `内容：${item.content}`].join("\n"),
+      fingerprint: sourceFingerprint(["document", item.id, item.title, item.content])
+    })),
+    ...events.map((item) => ({
+      type: "calendar",
+      id: item.id,
+      label: `日历：${compactLabel(`${item.date} ${item.title}`, "重要日子")}`,
+      text: [`日期：${item.date}`, `标题：${item.title}`, `备注：${item.note || ""}`].join("\n"),
+      fingerprint: sourceFingerprint(["calendar", item.id, item.date, item.title, item.note || "", item.createdBy || ""])
+    })),
+    ...notes.map((item) => ({
+      type: "note",
+      id: item.id,
+      label: `留言：${compactLabel(`${displayName(item.authorId)} ${String(item.createdAt || "").slice(0, 10)}`, "一条留言")}`,
+      text: [`作者：${displayName(item.authorId)}`, `时间：${item.createdAt || ""}`, `内容：${item.text}`].join("\n"),
+      fingerprint: sourceFingerprint(["note", item.id, item.authorId || "", item.createdAt || "", item.text])
+    }))
+  ].map(withSourceState).filter((source) => source.id && String(source.text || "").trim());
+}
+
+function chatMemorySource(session, messages, newMessages) {
+  const firstNewIndex = Math.max(0, messages.findIndex((message) => message.id === newMessages[0]?.id));
+  const contextMessages = messages.slice(Math.max(0, firstNewIndex - 6));
+  const lastMessage = messages[messages.length - 1] || {};
+  const text = contextMessages
+    .map((message) => `${displayName(message.senderId)}：${message.text}`)
+    .join("\n")
+    .slice(-MAX_MEMORY_SOURCE_CHARS);
+  return withSourceState({
+    type: "chat",
+    id: session.id,
+    label: `聊天：${compactLabel(session.title || DEFAULT_SESSION_TITLE, DEFAULT_SESSION_TITLE)}`,
+    text,
+    fingerprint: sourceFingerprint(["chat", session.id, lastMessage.id || "", lastMessage.createdAt || "", messages.length]),
+    processedUntilAt: lastMessage.createdAt || nowIso()
+  });
+}
+
+function withSourceState(source) {
+  return {
+    ...source,
+    sourceKey: memorySourceKey(source.type, source.id),
+    stateId: memorySourceStateId(source.type, source.id)
+  };
+}
+
+function sourcePromptText(sources) {
+  return sources.map((source) => [
+    `【sourceType=${source.type} sourceId=${source.id}】`,
+    `来源名称：${source.label}`,
+    source.text
+  ].join("\n")).join("\n\n");
+}
+
+function chunkMemorySources(sources) {
+  const batches = [];
+  let current = [];
+  let currentLength = 0;
+  for (const source of sources) {
+    const sourceLength = sourcePromptText([source]).length;
+    if (current.length && currentLength + sourceLength > MAX_MEMORY_SOURCE_CHARS) {
+      batches.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(source);
+    currentLength += sourceLength;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function fallbackMemoryItems(sources) {
+  return sources.map((source) => ({
+    content: `共同资料摘要：${source.text.replace(/\s+/g, " ").slice(0, 180)}`,
+    sourceRefs: [sourceRefFromSource(source)]
+  })).filter((item) => item.content.trim());
+}
+
+function parseMemoryItems(raw, sources) {
+  const parsed = parseJsonArray(raw);
+  if (!Array.isArray(parsed)) return null;
+  const sourceMap = new Map(sources.map((source) => [source.sourceKey, source]));
+  const items = parsed.map((value) => memoryItemFromParsed(value, sources, sourceMap)).filter(Boolean);
+  return parsed.length && !items.length ? null : items;
+}
+
+function parseJsonArray(raw) {
   try {
     const jsonText = String(raw || "").replace(/^```(?:json)?\s*|\s*```$/g, "");
     const parsed = JSON.parse(jsonText);
-    return Array.isArray(parsed) ? parsed.map((value) => String(value).trim()).filter(Boolean) : [];
+    return Array.isArray(parsed) ? parsed : null;
   } catch {
-    return [];
+    return null;
   }
+}
+
+function memoryItemFromParsed(value, sources, sourceMap) {
+  if (typeof value === "string") {
+    if (sources.length !== 1) return null;
+    return { content: value.trim(), sourceRefs: [sourceRefFromSource(sources[0])] };
+  }
+  if (!value || typeof value !== "object") return null;
+  const content = String(value.content || value.memory || value.text || "").trim();
+  if (!content) return null;
+  const sourceRefs = parseMemoryItemRefs(value, sources, sourceMap);
+  if (!sourceRefs.length) return null;
+  return { content, sourceRefs, sourceType: value.sourceType || value.type || "" };
+}
+
+function parseMemoryItemRefs(value, sources, sourceMap) {
+  const refs = [];
+  const candidates = [];
+  if (Array.isArray(value.sources)) candidates.push(...value.sources);
+  if (Array.isArray(value.sourceRefs)) candidates.push(...value.sourceRefs);
+  if (value.sourceType && value.sourceId) candidates.push({ type: value.sourceType, id: value.sourceId });
+  if (value.type && value.id) candidates.push({ type: value.type, id: value.id });
+  if (value.sourceType && Array.isArray(value.sourceIds)) {
+    candidates.push(...value.sourceIds.map((id) => ({ type: value.sourceType, id })));
+  }
+  if (!candidates.length && sources.length === 1) return [sourceRefFromSource(sources[0])];
+
+  for (const candidate of candidates) {
+    let source = null;
+    if (typeof candidate === "string") {
+      source = sources.find((item) => item.id === candidate || item.sourceKey === candidate);
+    } else if (candidate && typeof candidate === "object") {
+      const type = String(candidate.type || candidate.sourceType || "").trim();
+      const id = String(candidate.id || candidate.sourceId || "").trim();
+      source = sourceMap.get(memorySourceKey(type, id)) || sources.find((item) => item.id === id && (!type || item.type === type));
+    }
+    if (source) refs.push(sourceRefFromSource(source));
+  }
+  const seen = new Set();
+  return refs.filter((ref) => {
+    const key = memorySourceKey(ref.type, ref.id);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function normalizedSourceRefs(refs) {
+  if (!Array.isArray(refs)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const ref of refs) {
+    if (!ref || typeof ref !== "object") continue;
+    const type = String(ref.type || ref.sourceType || "").trim();
+    const id = String(ref.id || ref.sourceId || "").trim();
+    if (!type || !id) continue;
+    const key = memorySourceKey(type, id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ type, id, label: compactLabel(ref.label || sourceTypeName(type), sourceTypeName(type)) });
+  }
+  return result;
+}
+
+function sourceRefFromSource(source) {
+  return { type: source.type, id: source.id, label: source.label };
+}
+
+function memorySourceType(sourceRefs, fallback = "") {
+  const types = unique(sourceRefs.map((ref) => ref.type));
+  if (types.length === 1) return types[0];
+  if (types.length > 1) return "mixed";
+  return String(fallback || "mixed");
+}
+
+function memorySourceLabel(sourceRefs, sourceType) {
+  if (sourceRefs.length === 1) return `来自${sourceRefs[0].label}`;
+  if (sourceRefs.length > 1) return `来自多个来源：${sourceRefs.slice(0, 2).map((ref) => ref.label).join("、")}`;
+  return legacySourceLabel(sourceType);
+}
+
+function legacySourceLabel(sourceType) {
+  const value = String(sourceType || "");
+  if (value.includes("chat")) return "来自聊天";
+  if (value === "document") return "来自回忆文档";
+  if (value === "calendar") return "来自日历";
+  if (value === "note") return "来自留言";
+  if (value.includes("document") || value.includes("calendar") || value.includes("note") || value === "mixed") return "来自多个来源";
+  return "来自聊天";
+}
+
+function sourceTypeName(type) {
+  if (type === "document") return "回忆文档";
+  if (type === "calendar") return "日历";
+  if (type === "note") return "留言";
+  if (type === "chat") return "聊天";
+  return "来源";
+}
+
+function hasDuplicateMemory(current, content, memoryKey) {
+  const normalized = normalizeMemoryContent(content);
+  return current.some((memory) => {
+    const existingKey = memory.memoryKey || memoryKeyForContent(memory.content || "");
+    if (existingKey && existingKey === memoryKey) return true;
+    const existing = normalizeMemoryContent(memory.content || "");
+    return normalized.length >= 10 && existing.length >= 10 && (normalized.includes(existing) || existing.includes(normalized));
+  });
+}
+
+async function memorySourceStatesMap() {
+  const states = await query(collections.memorySourceStates);
+  return new Map(states.map((state) => [state.id, state]));
+}
+
+async function getMemorySourceState(type, id) {
+  return get(collections.memorySourceStates, memorySourceStateId(type, id));
+}
+
+async function markMemorySourceProcessed(source, memoryIds) {
+  const current = await getMemorySourceState(source.type, source.id);
+  const timestamp = nowIso();
+  await put(collections.memorySourceStates, source.stateId, {
+    ...current,
+    id: source.stateId,
+    sourceType: source.type,
+    sourceId: source.id,
+    sourceKey: source.sourceKey,
+    fingerprint: source.fingerprint,
+    processedAt: timestamp,
+    processedUntilAt: source.processedUntilAt || current?.processedUntilAt || null,
+    generatedMemoryIds: unique([...(current?.generatedMemoryIds || []), ...memoryIds]).slice(-100)
+  });
+}
+
+function memorySourceKey(type, id) {
+  return `${String(type || "").trim()}:${String(id || "").trim()}`;
+}
+
+function memorySourceStateId(type, id) {
+  return `memory-source-${hashText(memorySourceKey(type, id)).slice(0, 32)}`;
+}
+
+function sourceFingerprint(parts) {
+  return hashText(JSON.stringify(parts));
+}
+
+function memoryKeyForContent(content) {
+  const normalized = normalizeMemoryContent(content);
+  return normalized ? hashText(normalized) : "";
+}
+
+function normalizeMemoryContent(content) {
+  return String(content || "").normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function hashText(text) {
+  return createHash("sha1").update(String(text)).digest("hex");
+}
+
+function compactLabel(value, fallback) {
+  return String(value || fallback || "").replace(/\s+/g, " ").trim().slice(0, 80) || fallback || "来源";
+}
+
+function unique(values) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
 }
