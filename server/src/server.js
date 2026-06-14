@@ -874,7 +874,7 @@ async function messagesForSession(sessionId, limit = null) {
 
 async function get(collection, id) {
   const result = await collection.doc(id).get();
-  return result.data?.[0] || null;
+  return firstDocument(result);
 }
 
 async function put(collection, id, data) {
@@ -891,6 +891,11 @@ async function query(collection, where = null, orderField = null, orderDirection
 function withoutDatabaseId(data) {
   const { _id, ...result } = data;
   return result;
+}
+
+function firstDocument(result) {
+  if (Array.isArray(result?.data)) return result.data[0] || null;
+  return result?.data || null;
 }
 
 function publicFeature(item) {
@@ -1166,7 +1171,7 @@ async function acquireChatReplyLock(sessionId) {
   return db.runTransaction(async (transaction) => {
     const reference = transaction.collection("sessions").doc(sessionId);
     const result = await reference.get();
-    const session = result.data?.[0];
+    const session = firstDocument(result);
     if (!session) {
       const error = new Error("没有找到这个聊天");
       error.code = "session_not_found";
