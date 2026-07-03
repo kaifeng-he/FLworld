@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -214,9 +215,13 @@ fun WorldApp() {
 
     fun syncLocation() {
         scope.launch {
+            if (!locationHelper.hasLocationServiceEnabled()) {
+                report("请先打开手机系统定位服务，再更新距离")
+                return@launch
+            }
             val location = locationHelper.currentCoarseLocation()
             if (location == null) {
-                report("定位暂时不可用，稍后再试试")
+                report("暂时没拿到当前位置，请确认定位已开启后再点更新距离")
                 return@launch
             }
             runCatching {
@@ -427,11 +432,8 @@ fun WorldApp() {
                         albumQuota = albumQuota,
                         onOpen = { activeWorldPage = it },
                         onRefreshDistance = {
-                            scope.launch {
-                                runCatching { api.distance() }
-                                    .onSuccess { distance = it }
-                                    .onFailure { report(it.message ?: "距离刷新失败") }
-                            }
+                            if (locationHelper.hasPermission()) syncLocation()
+                            else locationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
                         }
                     )
                     WorldPage.Notes -> NotesScreen(
@@ -753,6 +755,7 @@ private fun ChatScreen(
     var deletingPersona by remember { mutableStateOf<Persona?>(null) }
     var deletingSession by remember { mutableStateOf<ChatSession?>(null) }
     var selectedPersonaId by remember { mutableStateOf(DEFAULT_PERSONA_ID) }
+    val messageListState = rememberLazyListState()
     val activePersona = selectedSession?.let { session -> personas.firstOrNull { it.id == session.personaId } }
     val defaultPersonaName = personas.firstOrNull { it.id == DEFAULT_PERSONA_ID }?.name ?: "温柔情感陪伴"
     val selectedPersonaName = personas.firstOrNull { it.id == selectedPersonaId }?.name ?: defaultPersonaName
@@ -760,6 +763,12 @@ private fun ChatScreen(
 
     LaunchedEffect(personas, selectedPersonaId) {
         if (personas.none { it.id == selectedPersonaId }) selectedPersonaId = DEFAULT_PERSONA_ID
+    }
+
+    LaunchedEffect(selectedSession?.id, messages.size, messages.lastOrNull()?.text) {
+        if (selectedSession != null && messages.isNotEmpty()) {
+            messageListState.scrollToItem(messages.lastIndex)
+        }
     }
 
     if (selectedSession == null) {
@@ -871,7 +880,11 @@ private fun ChatScreen(
             }
         }
         Spacer(Modifier.height(10.dp))
-        LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            state = messageListState,
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             items(messages) { message ->
                 val mine = message.senderId == currentUserId
                 val label = when {
@@ -1039,6 +1052,19 @@ private fun NotesScreen(
     onMarkRead: (Note) -> Unit
 ) {
     var text by remember { mutableStateOf("") }
+    val sortedNotes = remember(notes) { notes.sortedBy { it.createdAt } }
+    val unreadNoteIds = sortedNotes
+        .filter { it.authorId != currentUserId && it.readAt == null }
+        .joinToString("|") { it.id }
+    val noteListState = rememberLazyListState()
+    LaunchedEffect(unreadNoteIds) {
+        sortedNotes
+            .filter { it.authorId != currentUserId && it.readAt == null }
+            .forEach { onMarkRead(it) }
+    }
+    LaunchedEffect(sortedNotes.size, sortedNotes.lastOrNull()?.id) {
+        if (sortedNotes.isNotEmpty()) noteListState.scrollToItem(sortedNotes.lastIndex)
+    }
     Column(Modifier.fillMaxSize()) {
         PageTitle("我想对你说", onBack, "给对方留下一句只属于你们的话")
         SectionCard {
@@ -1056,9 +1082,12 @@ private fun NotesScreen(
             ) { Text("留下这句话") }
         }
         Spacer(Modifier.height(10.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(notes.sortedBy { it.createdAt }) { note ->
-                LaunchedEffect(note.id) { onMarkRead(note) }
+        LazyColumn(
+            state = noteListState,
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(sortedNotes) { note ->
                 val mine = note.authorId == currentUserId
                 MessageBubble(
                     label = if (mine) "我说的" else "${displayName(note.authorId)}说的",
