@@ -50,6 +50,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
@@ -146,6 +147,7 @@ fun WorldApp() {
     var memoryDocuments by remember { mutableStateOf(emptyList<MemoryDocument>()) }
     var aiMemories by remember { mutableStateOf(emptyList<AiMemory>()) }
     var loginStatus by remember { mutableStateOf("") }
+    var loginInProgress by remember { mutableStateOf(false) }
     var errorLogs by remember { mutableStateOf(emptyList<String>()) }
     var backgroundClarity by remember { mutableStateOf(prefs.getFloat(BACKGROUND_CLARITY_KEY, DEFAULT_BACKGROUND_CLARITY)) }
     var readingOverlayStrength by remember {
@@ -249,23 +251,31 @@ fun WorldApp() {
             selectedUserId = userId,
             code = code,
             status = loginStatus,
+            isLoading = loginInProgress,
             onUserId = { userId = it },
             onCode = { code = it },
             onLogin = {
-                scope.launch {
-                    runCatching { api.login(userId, code.ifBlank { userId }, deviceId) }
-                        .onSuccess { result ->
-                            token = result.first
-                            userId = result.second.id
-                            userName = result.second.name
-                            prefs.edit()
-                                .putString("token", result.first)
-                                .putString("userId", result.second.id)
-                                .putString("userName", result.second.name)
-                                .apply()
-                            loginStatus = ""
+                if (!loginInProgress) {
+                    loginInProgress = true
+                    scope.launch {
+                        try {
+                            runCatching { api.login(userId, code.ifBlank { userId }, deviceId) }
+                                .onSuccess { result ->
+                                    token = result.first
+                                    userId = result.second.id
+                                    userName = result.second.name
+                                    prefs.edit()
+                                        .putString("token", result.first)
+                                        .putString("userId", result.second.id)
+                                        .putString("userName", result.second.name)
+                                        .apply()
+                                    loginStatus = ""
+                                }
+                                .onFailure { loginStatus = it.message ?: "登录失败" }
+                        } finally {
+                            loginInProgress = false
                         }
-                        .onFailure { loginStatus = it.message ?: "登录失败" }
+                    }
                 }
             }
         )
@@ -603,44 +613,120 @@ private fun LoginScreen(
     selectedUserId: String,
     code: String,
     status: String,
+    isLoading: Boolean,
     onUserId: (String) -> Unit,
     onCode: (String) -> Unit,
     onLogin: () -> Unit
 ) {
     AppBackground(backgroundClarity, readingOverlayStrength) {
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(24.dp),
-            verticalArrangement = Arrangement.Center
+            contentAlignment = Alignment.Center
         ) {
-            Text("FL小世界", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold, color = Color(0xFF7C3348))
-            Text("只属于两个人的陪伴、记录和日常。", color = Color(0xFF7B626A), modifier = Modifier.padding(top = 6.dp))
-            Spacer(Modifier.height(28.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                IdentityButton("锋宝", selectedUserId == "hkf", Modifier.weight(1f)) { onUserId("hkf") }
-                IdentityButton("璐宝", selectedUserId == "cl", Modifier.weight(1f)) { onUserId("cl") }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(28.dp))
+                    .background(Color(0xFFFFFBFD).copy(alpha = 0.94f))
+                    .border(BorderStroke(1.dp, Color(0xFFFFFFFF).copy(alpha = 0.86f)), RoundedCornerShape(28.dp))
+                    .padding(22.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    "FL小世界",
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF5E2440)
+                )
+                Text(
+                    "只属于两个人的陪伴、记录和日常。",
+                    color = Color(0xFF57424A),
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+                Spacer(Modifier.height(28.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    IdentityButton(
+                        "锋宝",
+                        selectedUserId == "hkf",
+                        Modifier.weight(1f),
+                        enabled = !isLoading
+                    ) { onUserId("hkf") }
+                    IdentityButton(
+                        "璐宝",
+                        selectedUserId == "cl",
+                        Modifier.weight(1f),
+                        enabled = !isLoading
+                    ) { onUserId("cl") }
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = onCode,
+                    label = { Text("进入口令") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !isLoading,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color(0xFF34242C),
+                        unfocusedTextColor = Color(0xFF34242C),
+                        focusedLabelColor = Color(0xFF5E2440),
+                        unfocusedLabelColor = Color(0xFF6D5961),
+                        focusedBorderColor = Color(0xFF5E2440),
+                        unfocusedBorderColor = Color(0xFF8E717D),
+                        cursorColor = Color(0xFF5E2440),
+                        focusedContainerColor = Color.White.copy(alpha = 0.72f),
+                        unfocusedContainerColor = Color.White.copy(alpha = 0.72f),
+                        disabledContainerColor = Color.White.copy(alpha = 0.52f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(18.dp))
+                Button(
+                    onClick = onLogin,
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF5E2440),
+                        contentColor = Color.White,
+                        disabledContainerColor = Color(0xFF8D7880),
+                        disabledContentColor = Color.White
+                    )
+                ) {
+                    Text(if (isLoading) "正在进入..." else "进入小世界", fontWeight = FontWeight.SemiBold)
+                }
+                if (status.isNotBlank()) {
+                    Text(status, color = Color(0xFF8A1E34), modifier = Modifier.padding(top = 12.dp))
+                }
             }
-            Spacer(Modifier.height(12.dp))
-            OutlinedTextField(
-                value = code,
-                onValueChange = onCode,
-                label = { Text("进入口令") },
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(18.dp))
-            Button(onClick = onLogin, modifier = Modifier.fillMaxWidth()) { Text("进入小世界") }
-            if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp))
         }
     }
 }
 
 @Composable
-private fun IdentityButton(text: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    val color = if (selected) MaterialTheme.colorScheme.primary else Color(0xFF8B737A)
-    OutlinedButton(onClick = onClick, modifier = modifier) {
-        Text(text, color = color, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+private fun IdentityButton(
+    text: String,
+    selected: Boolean,
+    modifier: Modifier,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    val contentColor = if (selected) Color.White else Color(0xFF4E3944)
+    val containerColor = if (selected) Color(0xFF6A2A48) else Color.White.copy(alpha = 0.72f)
+    val borderColor = if (selected) Color(0xFF6A2A48) else Color(0xFF8E717D)
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier,
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+            disabledContainerColor = Color(0xFFE9DDE2),
+            disabledContentColor = Color(0xFF806A73)
+        ),
+        border = BorderStroke(1.dp, borderColor)
+    ) {
+        Text(text, fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold)
     }
 }
 
@@ -670,6 +756,7 @@ private fun ChatScreen(
     val activePersona = selectedSession?.let { session -> personas.firstOrNull { it.id == session.personaId } }
     val defaultPersonaName = personas.firstOrNull { it.id == DEFAULT_PERSONA_ID }?.name ?: "温柔情感陪伴"
     val selectedPersonaName = personas.firstOrNull { it.id == selectedPersonaId }?.name ?: defaultPersonaName
+    fun personaNameFor(personaId: String): String = personas.firstOrNull { it.id == personaId }?.name ?: defaultPersonaName
 
     LaunchedEffect(personas, selectedPersonaId) {
         if (personas.none { it.id == selectedPersonaId }) selectedPersonaId = DEFAULT_PERSONA_ID
@@ -680,7 +767,8 @@ private fun ChatScreen(
             item {
                 SectionCard {
                     Text("聊天", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF6B2944))
-                    Text("当前聊天风格：$selectedPersonaName", color = Color(0xFF66546F))
+                    Text("新建对话风格：$selectedPersonaName", color = Color(0xFF66546F))
+                    Text("创建后这个会话会固定使用该风格，双方打开时一致。", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
                     PersonaPicker(personas, selectedPersonaId) { selectedPersonaId = it }
                     Spacer(Modifier.height(14.dp))
@@ -690,7 +778,7 @@ private fun ChatScreen(
                             enabled = personas.isNotEmpty(),
                             modifier = Modifier.weight(1f)
                         ) { Text("新建对话") }
-                        OutlinedButton(onClick = { showPersonaManager = true }) { Text("聊天风格") }
+                        OutlinedButton(onClick = { showPersonaManager = true }) { Text("管理风格") }
                     }
                 }
             }
@@ -709,7 +797,10 @@ private fun ChatScreen(
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Text(session.title, fontWeight = FontWeight.SemiBold)
-                            Text("${dateText(session.updatedAt)} · 由 ${displayName(session.createdBy)} 创建", color = Color(0xFF766A70))
+                            Text(
+                                "${dateText(session.updatedAt)} · 由 ${displayName(session.createdBy)} 创建 · 风格：${personaNameFor(session.personaId)}",
+                                color = Color(0xFF766A70)
+                            )
                         }
                         TextButton(onClick = { deletingSession = session }) { Text("删除") }
                     }
@@ -1277,6 +1368,13 @@ private fun PersonaManagerDialog(
         text = {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item {
+                    Text(
+                        "每个会话只使用一种风格，由创建会话时的选择决定；双方进入同一会话会看到并使用同一风格。编辑已有风格会影响使用它的会话后续回复。",
+                        color = Color(0xFF6F5F66),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                item {
                     PersonaForm(
                         persona = editingPersona,
                         onSave = onSave,
@@ -1323,8 +1421,8 @@ private fun PersonaForm(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
         Text(if (persona == null) "新建聊天风格" else "编辑聊天风格", fontWeight = FontWeight.SemiBold)
         OutlinedTextField(name, { name = it }, label = { Text("名称") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(desc, { desc = it }, label = { Text("说话风格") }, modifier = Modifier.fillMaxWidth())
-        Text("长期记忆请在小世界的“回忆”中共同管理。", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
+        OutlinedTextField(desc, { desc = it }, label = { Text("风格指令") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+        Text("这里控制小暖在该会话中的表达方式；长期记忆请在小世界的“回忆”中共同管理。", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
         Text("机器人消息颜色", color = Color(0xFF6F5F66), style = MaterialTheme.typography.bodySmall)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             personaColorOptions().forEach { color ->
@@ -1363,7 +1461,7 @@ private fun PersonaPicker(personas: List<Persona>, selected: String, onChange: (
             value = name,
             onValueChange = {},
             readOnly = true,
-            label = { Text("聊天风格") },
+            label = { Text("新对话风格") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
             modifier = Modifier.menuAnchor().fillMaxWidth()
         )

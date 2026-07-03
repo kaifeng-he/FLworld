@@ -1051,12 +1051,15 @@ function cleanTitle(text) {
 }
 
 function assistantSystemPrompt(persona, memories = []) {
+  const styleName = String(persona?.name || "未命名风格").trim() || "未命名风格";
+  const styleDescription = String(persona?.description || "").trim() || "自然、真诚地回应当前对话。";
   const savedMemories = memories.length
     ? memories.map((memory) => `- ${memory.content}`).join("\n")
     : "暂无";
   return [
-    persona.description,
-    "你的名字是小暖。",
+    "你是恺锋和小璐共同会话中的 AI 陪伴者，名字是小暖。",
+    `当前会话风格：${styleName}\n${styleDescription}`,
+    "风格规则：每个会话只有一个当前会话风格，回复时只执行上面的风格指令；不要混用其他聊天风格，也不要把默认风格的表达设定带入自定义风格。",
     `长期记忆：\n${savedMemories}`,
     "称呼规则：内部账号 hkf、cl、HKF、CL 只用于系统识别，回复时绝对不要输出这些账号或缩写。提到两位用户时，只称呼为“恺锋”和“小璐”。",
     "回复正文不要以“小暖：”“机器人：”“助手：”或类似角色标签开头。"
